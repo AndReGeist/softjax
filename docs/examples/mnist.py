@@ -9,6 +9,7 @@ loss against the ground-truth ranking.
 """
 
 import argparse
+import os
 import random
 
 import equinox as eqx
@@ -17,6 +18,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 import optax
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets
@@ -203,6 +205,8 @@ def main():
     parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("-l", "--nloglr", type=float, default=3.5, help="Negative log learning rate")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--results_csv", type=str, default="results.csv")
+    parser.add_argument("--curves_csv", type=str, default="curves.csv")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -279,6 +283,7 @@ def main():
     # --- Training loop ---
     best_valid_acc = 0.0
     test_acc = None
+    curve_records = []
 
     for iter_idx, (data, targets) in tqdm(
         enumerate(load_n(train_loader, args.num_steps)),
@@ -288,16 +293,53 @@ def main():
         data, targets = data.numpy(), targets.numpy()
         model, opt_state, loss = make_step(model, opt_state, data, targets)
 
+        record = {"step": iter_idx, "train_loss": loss.item()}
+
         if (iter_idx + 1) % args.eval_freq == 0:
             valid_acc = evaluate_loader(model, valid_loader)
             print(f"{iter_idx} valid {valid_acc}")
+            record["val_acc_em"] = valid_acc["acc_em"]
+            record["val_acc_ew"] = valid_acc["acc_ew"]
+            record["val_acc_em5"] = valid_acc["acc_em5"]
 
             if valid_acc["acc_em5"] > best_valid_acc:
                 best_valid_acc = valid_acc["acc_em5"]
                 test_acc = evaluate_loader(model, test_loader)
                 print(f"{iter_idx} test  {test_acc}")
 
+        curve_records.append(record)
+
     print(f"final test {test_acc}")
+
+    # --- Save curves CSV ---
+    curves_df = pd.DataFrame(curve_records)
+    curves_df["method"] = method
+    curves_df["mode"] = mode
+    curves_df["softness"] = softness
+    curves_df["num_compare"] = args.num_compare
+    curves_df["seed"] = args.seed
+    header = not os.path.exists(args.curves_csv)
+    curves_df.to_csv(args.curves_csv, mode="a", header=header, index=False)
+
+    # --- Save results CSV ---
+    result = {
+        "method": method,
+        "mode": mode,
+        "softness": softness,
+        "standardize": standardize,
+        "num_compare": args.num_compare,
+        "num_steps": args.num_steps,
+        "nloglr": args.nloglr,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "test_acc_em": test_acc["acc_em"] if test_acc else None,
+        "test_acc_ew": test_acc["acc_ew"] if test_acc else None,
+        "test_acc_em5": test_acc["acc_em5"] if test_acc else None,
+        "best_valid_acc_em5": best_valid_acc,
+    }
+    results_df = pd.DataFrame([result])
+    header = not os.path.exists(args.results_csv)
+    results_df.to_csv(args.results_csv, mode="a", header=header, index=False)
 
 
 if __name__ == "__main__":
