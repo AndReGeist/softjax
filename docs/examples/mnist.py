@@ -1,8 +1,7 @@
-"""MNIST sorting benchmark using SoftJAX.
+"""Sort numbers consisting of MNIST digits.
 
 Reproduces the multi-digit MNIST sorting experiment from the DiffSort paper
-(Petersen et al., ICLR 2022) using JAX, Equinox, and SoftJAX instead of
-PyTorch and DiffSort.
+(Petersen et al., ICLR 2022) using JAX, Equinox, and SoftJAX.
 
 A CNN learns to map concatenated multi-digit MNIST images to scalar scores.
 A soft argsort produces a differentiable permutation matrix, trained via BCE
@@ -61,12 +60,10 @@ class MultiDigitDataset(Dataset):
             torch.random.set_rng_state(self.rand_state)
 
         images = []
-        labels_ = None
+        labels_ = torch.zeros(self.num_compare, dtype=torch.float32)
         for digit_idx in range(self.num_digits):
             ids = torch.randint(len(self), (self.num_compare,))
             images.append(self.images[ids].type(torch.float32) / 255.0)
-            if labels_ is None:
-                labels_ = torch.zeros(self.num_compare, dtype=torch.float32)
             labels_ = labels_ + 10.0 ** (self.num_digits - 1 - digit_idx) * self.labels[ids]
 
         images = torch.cat(images, dim=-1)  # (num_compare, 1, 28, num_digits*28)
