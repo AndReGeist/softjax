@@ -22,11 +22,11 @@ def plot_curves(curves_df, ax_loss, ax_val):
 
     for key, group in groups:
         label = run_label(dict(zip(["method", "softness", "num_compare", "mode", "seed"], key)))
-        ax_loss.plot(group["step"], group["train_loss"], label=label, alpha=0.8)
+        ax_loss.semilogy(group["step"], group["train_loss"], label=label, alpha=0.8)
 
-        val = group.dropna(subset=["val_acc_em"])
+        val = group.dropna(subset=["val_acc_ew"])
         if not val.empty:
-            ax_val.plot(val["step"], val["val_acc_em"], marker="o", markersize=3, label=label, alpha=0.8)
+            ax_val.plot(val["step"], val["val_acc_ew"], linestyle="--", marker="o", markersize=3, label=label, alpha=0.8)
 
     ax_loss.set_xlabel("Step")
     ax_loss.set_ylabel("Train Loss")
@@ -34,7 +34,7 @@ def plot_curves(curves_df, ax_loss, ax_val):
     ax_loss.legend(fontsize="small")
 
     ax_val.set_xlabel("Step")
-    ax_val.set_ylabel("Validation Exact Match")
+    ax_val.set_ylabel("Validation Element-wise match")
     ax_val.set_title("Validation Accuracy")
     ax_val.legend(fontsize="small")
 

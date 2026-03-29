@@ -285,11 +285,12 @@ def main():
     test_acc = None
     curve_records = []
 
-    for iter_idx, (data, targets) in tqdm(
+    pbar = tqdm(
         enumerate(load_n(train_loader, args.num_steps)),
         desc="Training",
         total=args.num_steps,
-    ):
+    )
+    for iter_idx, (data, targets) in pbar:
         data, targets = data.numpy(), targets.numpy()
         model, opt_state, loss = make_step(model, opt_state, data, targets)
 
@@ -297,7 +298,8 @@ def main():
 
         if (iter_idx + 1) % args.eval_freq == 0:
             valid_acc = evaluate_loader(model, valid_loader)
-            print(f"{iter_idx} valid {valid_acc}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", em=f"{valid_acc['acc_em']:.3f}", ew=f"{valid_acc['acc_ew']:.3f}")
+            tqdm.write(f"{iter_idx} valid {valid_acc}")
             record["val_acc_em"] = valid_acc["acc_em"]
             record["val_acc_ew"] = valid_acc["acc_ew"]
             record["val_acc_em5"] = valid_acc["acc_em5"]
@@ -305,7 +307,7 @@ def main():
             if valid_acc["acc_em5"] > best_valid_acc:
                 best_valid_acc = valid_acc["acc_em5"]
                 test_acc = evaluate_loader(model, test_loader)
-                print(f"{iter_idx} test  {test_acc}")
+                tqdm.write(f"{iter_idx} test  {test_acc}")
 
         curve_records.append(record)
 
