@@ -58,9 +58,9 @@ def plot_scatter(results_df, ax):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot MNIST sorting experiment results")
-    parser.add_argument("--results_csv", type=str, default="results.csv")
-    parser.add_argument("--curves_csv", type=str, default="curves.csv")
-    parser.add_argument("--out", type=str, default=None, help="Save figure to file instead of showing")
+    parser.add_argument("--results_csv", type=str, default="docs/examples/mnist/results.csv")
+    parser.add_argument("--curves_csv", type=str, default="docs/examples/mnist/curves.csv")
+    parser.add_argument("--out", type=str, default="docs/examples/mnist/mnist_plot.png", help="Save figure to file instead of showing")
     args = parser.parse_args()
 
     curves_df = pd.read_csv(args.curves_csv)
@@ -71,12 +71,8 @@ def main():
     plot_scatter(results_df, axes[2])
     fig.tight_layout()
 
-    if args.out:
-        fig.savefig(args.out, dpi=150)
-        print(f"Saved to {args.out}")
-    else:
-        plt.show()
-
+    fig.savefig(args.out, dpi=150)
+    print(f"Saved to {args.out}")
 
 if __name__ == "__main__":
     main()

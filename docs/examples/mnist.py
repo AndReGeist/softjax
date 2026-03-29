@@ -33,7 +33,7 @@ import softjax as sj
 
 
 class MultiDigitDataset(Dataset):
-    """Generates multi-digit MNIST comparison samples on the fly.
+    """Generates multi-digit MNIST samples.
 
     For each sample, ``num_compare`` composite images are created by
     concatenating ``num_digits`` randomly chosen MNIST digit images along the
@@ -190,7 +190,7 @@ def main():
     parser = argparse.ArgumentParser(description="MNIST sorting benchmark (SoftJAX)")
     parser.add_argument("-b", "--batch_size", type=int, default=100)
     parser.add_argument("-n", "--num_compare", type=int, default=5)
-    parser.add_argument("-i", "--num_steps", type=int, default=100_000)
+    parser.add_argument("-i", "--num_steps", type=int, default=200_000)
     parser.add_argument("-e", "--eval_freq", type=int, default=1_000)
     parser.add_argument(
         "--softness", type=float, default=0.1, help="Softness (inverse of diffsort steepness)"
@@ -203,10 +203,10 @@ def main():
         choices=["sorting_network", "neuralsort", "softsort", "ot"],
     )
     parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("-l", "--nloglr", type=float, default=3.5, help="Negative log learning rate")
+    parser.add_argument("-l", "--lr", type=float, default=3.0e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--results_csv", type=str, default="results.csv")
-    parser.add_argument("--curves_csv", type=str, default="curves.csv")
+    parser.add_argument("--results_csv", type=str, default="docs/examples/mnist/results.csv")
+    parser.add_argument("--curves_csv", type=str, default="docs/examples/mnist/curves.csv")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -223,7 +223,7 @@ def main():
     # --- Model and optimizer ---
     key, model_key = jrandom.split(key)
     model = MultiDigitMNISTNet(key=model_key)
-    optim = optax.adam(learning_rate=10 ** (-args.nloglr))
+    optim = optax.adam(learning_rate=args.lr)
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
     # Capture config in closures for the JIT-compiled functions.
@@ -293,7 +293,7 @@ def main():
         data, targets = data.numpy(), targets.numpy()
         model, opt_state, loss = make_step(model, opt_state, data, targets)
 
-        record = {"step": iter_idx, "train_loss": loss.item()}
+        record = {"step": iter_idx, "train_loss": loss.item(), "val_acc_em": None, "val_acc_ew": None, "val_acc_em5": None}
 
         if (iter_idx + 1) % args.eval_freq == 0:
             valid_acc = evaluate_loader(model, valid_loader)
@@ -310,6 +310,9 @@ def main():
         curve_records.append(record)
 
     print(f"final test {test_acc}")
+
+    # --- Ensure output directory exists ---
+    os.makedirs(os.path.dirname(args.curves_csv), exist_ok=True)
 
     # --- Save curves CSV ---
     curves_df = pd.DataFrame(curve_records)
@@ -329,7 +332,7 @@ def main():
         "standardize": standardize,
         "num_compare": args.num_compare,
         "num_steps": args.num_steps,
-        "nloglr": args.nloglr,
+        "lr": args.lr,
         "batch_size": args.batch_size,
         "seed": args.seed,
         "test_acc_em": test_acc["acc_em"] if test_acc else None,
