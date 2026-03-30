@@ -253,6 +253,7 @@ def main():
         @eqx.filter_jit
         def make_step(model, opt_state, data, targets):
             def loss_fn(model):
+                """BCE loss between predicted and true permutation matrices."""
                 scores = jax.vmap(jax.vmap(model))(data)  # (batch, num_compare)
                 perm_pred = sj.argsort(
                     scores, axis=-1, softness=softness, mode=mode,
@@ -291,11 +292,11 @@ def main():
         best_val_score = 0.0
         val_metric_key = "acc_em5"
         higher_is_better = True
-
-    else:  # quantile
+    elif task == "quantile":
         @eqx.filter_jit
         def make_step(model, opt_state, data, targets):
             def loss_fn(model):
+                """MSE between predicted and true quantiles."""
                 scores = jax.vmap(jax.vmap(model))(data)
                 pred_q = sj.quantile(
                     scores, q=quantile, axis=-1, softness=softness,
@@ -332,7 +333,6 @@ def main():
         best_val_score = float("inf")
         val_metric_key = "mse"
         higher_is_better = False
-
     # --- Training loop ---
     test_metrics = None
     curve_records = []
@@ -369,8 +369,10 @@ def main():
 
     print(f"final test {test_metrics}")
 
-    # --- Ensure output directory exists ---
-    os.makedirs(os.path.dirname(args.curves_csv), exist_ok=True)
+    for path in (args.curves_csv, args.results_csv):
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
 
     # --- Save curves CSV ---
     curves_df = pd.DataFrame(curve_records)
