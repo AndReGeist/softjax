@@ -1,11 +1,13 @@
-"""Sort numbers consisting of MNIST digits.
+"""Sort or quantile-regress numbers consisting of MNIST digits.
 
-Reproduces the multi-digit MNIST sorting experiment from the DiffSort paper
-(Petersen et al., ICLR 2022) using JAX, Equinox, and SoftJAX.
+Reproduces the multi-digit MNIST sorting and quantile regression experiments
+from the DiffSort / SoftSort papers using JAX, Equinox, and SoftJAX.
 
 A CNN learns to map concatenated multi-digit MNIST images to scalar scores.
-A soft argsort produces a differentiable permutation matrix, trained via BCE
-loss against the ground-truth ranking.
+- **sort** task: A soft argsort produces a differentiable permutation matrix,
+  trained via BCE loss against the ground-truth ranking.
+- **quantile** task: A soft quantile extracts a differentiable quantile value
+  (e.g. median) from the scores, trained via MSE against the true quantile.
 """
 
 import argparse
@@ -39,6 +41,11 @@ class MultiDigitDataset(Dataset):
     concatenating ``num_digits`` randomly chosen MNIST digit images along the
     width axis.  The label for each composite image is a multi-digit number
     (e.g. digits 3, 7, 4, 2 -> label 3742).
+    
+    Note that the implementation of this data loader is quite lazy. We pick random 
+    sequences with REPLACEMENT, so the same sequence may appear multiple times in an epoch, 
+    while some sequences may never appear.  This is done to avoid the combinatorial explosion of possible sequences, 
+    which would make it infeasible to pre-generate a fixed dataset of all possible sequences.
     """
 
     def __init__(self, images, labels, num_digits, num_compare, seed=0, determinism=True):
@@ -181,13 +188,26 @@ def bce_loss(pred, target):
     return -jnp.mean(target * jnp.log(pred) + (1.0 - target) * jnp.log(1.0 - pred))
 
 
+def spearman_correlation(pred, true):
+    """Spearman rank correlation between two 1-D numpy arrays."""
+    def _rank(x):
+        return np.argsort(np.argsort(x)).astype(np.float64)
+    n = len(pred)
+    if n < 2:
+        return float("nan")
+    d = _rank(pred) - _rank(true)
+    return 1.0 - 6.0 * np.sum(d ** 2) / (n * (n ** 2 - 1))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MNIST sorting benchmark (SoftJAX)")
+    parser = argparse.ArgumentParser(description="MNIST sorting / quantile benchmark (SoftJAX)")
+    parser.add_argument("--task", type=str, default="sort", choices=["sort", "quantile"])
+    parser.add_argument("--quantile", type=float, default=0.5, help="Quantile q in [0,1]; 0.5 = median")
     parser.add_argument("-b", "--batch_size", type=int, default=100)
     parser.add_argument("-n", "--num_compare", type=int, default=5)
     parser.add_argument("-i", "--num_steps", type=int, default=200_000)
@@ -227,62 +247,99 @@ def main():
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
     # Capture config in closures for the JIT-compiled functions.
+    task = args.task
+    quantile = args.quantile
     softness = args.softness
     mode = args.mode
     method = args.method
     standardize = args.standardize
 
-    @eqx.filter_jit
-    def make_step(model, opt_state, data, targets):
-        def loss_fn(model):
-            scores = jax.vmap(jax.vmap(model))(data)  # (batch, num_compare)
-            perm_pred = sj.argsort(
-                scores,
-                axis=-1,
-                softness=softness,
-                mode=mode,
-                method=method,
-                standardize=standardize,
-            )  # (batch, num_compare, num_compare)
-            num_compare = targets.shape[-1]
-            perm_gt = jax.nn.one_hot(jnp.argsort(targets, axis=-1), num_compare)
-            return bce_loss(perm_pred, perm_gt)
+    if task == "sort":
+        @eqx.filter_jit
+        def make_step(model, opt_state, data, targets):
+            def loss_fn(model):
+                """BCE loss between predicted and true permutation matrices."""
+                scores = jax.vmap(jax.vmap(model))(data)  # (batch, num_compare)
+                perm_pred = sj.argsort(
+                    scores, axis=-1, softness=softness, mode=mode,
+                    method=method, standardize=standardize,
+                )  # (batch, num_compare, num_compare)
+                num_compare = targets.shape[-1]
+                perm_gt = jax.nn.one_hot(jnp.argsort(targets, axis=-1), num_compare)
+                return bce_loss(perm_pred, perm_gt)
+            loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+            updates, new_opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+            model = eqx.apply_updates(model, updates)
+            return model, new_opt_state, loss
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        updates, new_opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-        model = eqx.apply_updates(model, updates)
-        return model, new_opt_state, loss
+        @eqx.filter_jit
+        def evaluate_batch(model, data, targets):
+            scores = jax.vmap(jax.vmap(model))(data)
+            pred_order = jnp.argsort(scores, axis=-1)
+            true_order = jnp.argsort(targets, axis=-1)
+            acc = pred_order == true_order
+            acc_em = jnp.all(acc, axis=-1).astype(jnp.float32).mean()
+            acc_ew = acc.astype(jnp.float32).mean()
+            scores5 = scores[:, :5]
+            targets5 = targets[:, :5]
+            acc5 = jnp.argsort(scores5, axis=-1) == jnp.argsort(targets5, axis=-1)
+            acc_em5 = jnp.all(acc5, axis=-1).astype(jnp.float32).mean()
+            return acc_em, acc_ew, acc_em5
 
-    @eqx.filter_jit
-    def evaluate_batch(model, data, targets):
-        scores = jax.vmap(jax.vmap(model))(data)  # (batch, num_compare)
+        def evaluate_loader(model, loader):
+            results = []
+            for data, targets in loader:
+                data, targets = data.numpy(), targets.numpy()
+                em, ew, em5 = evaluate_batch(model, data, targets)
+                results.append(dict(acc_em=em.item(), acc_ew=ew.item(), acc_em5=em5.item()))
+            return {k: np.mean([d[k] for d in results]) for k in results[0]}
 
-        pred_order = jnp.argsort(scores, axis=-1)
-        true_order = jnp.argsort(targets, axis=-1)
-        acc = pred_order == true_order
+        best_val_score = 0.0
+        val_metric_key = "acc_em5"
+        higher_is_better = True
+    elif task == "quantile":
+        @eqx.filter_jit
+        def make_step(model, opt_state, data, targets):
+            def loss_fn(model):
+                """MSE between predicted and true quantiles."""
+                scores = jax.vmap(jax.vmap(model))(data)
+                pred_q = sj.quantile(
+                    scores, q=quantile, axis=-1, softness=softness,
+                    mode=mode, method=method, standardize=standardize,
+                )
+                true_q = jnp.quantile(targets, q=quantile, axis=-1)
+                return jnp.mean((pred_q - true_q) ** 2)
+            loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+            updates, new_opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+            model = eqx.apply_updates(model, updates)
+            return model, new_opt_state, loss
 
-        acc_em = jnp.all(acc, axis=-1).astype(jnp.float32).mean()
-        acc_ew = acc.astype(jnp.float32).mean()
+        @eqx.filter_jit
+        def evaluate_batch(model, data, targets):
+            scores = jax.vmap(jax.vmap(model))(data)
+            pred_q = sj.quantile(scores, q=quantile, axis=-1, mode="hard")
+            true_q = jnp.quantile(targets, q=quantile, axis=-1)
+            mse = jnp.mean((pred_q - true_q) ** 2)
+            return mse, pred_q, true_q
 
-        # EM5: exact match restricted to first 5 elements.
-        scores5 = scores[:, :5]
-        targets5 = targets[:, :5]
-        acc5 = jnp.argsort(scores5, axis=-1) == jnp.argsort(targets5, axis=-1)
-        acc_em5 = jnp.all(acc5, axis=-1).astype(jnp.float32).mean()
+        def evaluate_loader(model, loader):
+            all_pred, all_true, mses = [], [], []
+            for data, targets in loader:
+                data, targets = data.numpy(), targets.numpy()
+                mse, pred_q, true_q = evaluate_batch(model, data, targets)
+                mses.append(mse.item())
+                all_pred.append(np.asarray(pred_q))
+                all_true.append(np.asarray(true_q))
+            return {
+                "mse": np.mean(mses),
+                "spearman": spearman_correlation(np.concatenate(all_pred), np.concatenate(all_true)),
+            }
 
-        return acc_em, acc_ew, acc_em5
-
-    def evaluate_loader(model, loader):
-        results = []
-        for data, targets in loader:
-            data, targets = data.numpy(), targets.numpy()
-            em, ew, em5 = evaluate_batch(model, data, targets)
-            results.append(dict(acc_em=em.item(), acc_ew=ew.item(), acc_em5=em5.item()))
-        return {k: np.mean([d[k] for d in results]) for k in results[0]}
-
+        best_val_score = float("inf")
+        val_metric_key = "mse"
+        higher_is_better = False
     # --- Training loop ---
-    best_valid_acc = 0.0
-    test_acc = None
+    test_metrics = None
     curve_records = []
 
     pbar = tqdm(
@@ -294,30 +351,38 @@ def main():
         data, targets = data.numpy(), targets.numpy()
         model, opt_state, loss = make_step(model, opt_state, data, targets)
 
-        record = {"step": iter_idx, "train_loss": loss.item(), "val_acc_em": None, "val_acc_ew": None, "val_acc_em5": None}
+        record = {"step": iter_idx, "train_loss": loss.item()}
 
         if (iter_idx + 1) % args.eval_freq == 0:
-            valid_acc = evaluate_loader(model, valid_loader)
-            pbar.set_postfix(loss=f"{loss.item():.4f}", em=f"{valid_acc['acc_em']:.3f}", ew=f"{valid_acc['acc_ew']:.3f}")
-            tqdm.write(f"{iter_idx} valid {valid_acc}")
-            record["val_acc_em"] = valid_acc["acc_em"]
-            record["val_acc_ew"] = valid_acc["acc_ew"]
-            record["val_acc_em5"] = valid_acc["acc_em5"]
+            valid_metrics = evaluate_loader(model, valid_loader)
+            tqdm.write(f"{iter_idx} valid {valid_metrics}")
+            if task == "sort":
+                pbar.set_postfix(loss=f"{loss.item():.4f}", em=f"{valid_metrics['acc_em']:.3f}", ew=f"{valid_metrics['acc_ew']:.3f}")
+                record.update(val_acc_em=valid_metrics["acc_em"], val_acc_ew=valid_metrics["acc_ew"], val_acc_em5=valid_metrics["acc_em5"])
+            else:
+                pbar.set_postfix(loss=f"{loss.item():.4f}", mse=f"{valid_metrics['mse']:.4f}", spear=f"{valid_metrics['spearman']:.3f}")
+                record.update(val_mse=valid_metrics["mse"], val_spearman=valid_metrics["spearman"])
 
-            if valid_acc["acc_em5"] > best_valid_acc:
-                best_valid_acc = valid_acc["acc_em5"]
-                test_acc = evaluate_loader(model, test_loader)
-                tqdm.write(f"{iter_idx} test  {test_acc}")
+            val_score = valid_metrics[val_metric_key]
+            improved = val_score > best_val_score if higher_is_better else val_score < best_val_score
+            if improved:
+                best_val_score = val_score
+                test_metrics = evaluate_loader(model, test_loader)
+                tqdm.write(f"{iter_idx} test  {test_metrics}")
 
         curve_records.append(record)
 
-    print(f"final test {test_acc}")
+    print(f"final test {test_metrics}")
 
-    # --- Ensure output directory exists ---
-    os.makedirs(os.path.dirname(args.curves_csv), exist_ok=True)
+    for path in (args.curves_csv, args.results_csv):
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
 
     # --- Save curves CSV ---
     curves_df = pd.DataFrame(curve_records)
+    curves_df["task"] = task
+    curves_df["quantile"] = quantile if task == "quantile" else None
     curves_df["method"] = method
     curves_df["mode"] = mode
     curves_df["softness"] = softness
@@ -328,6 +393,8 @@ def main():
 
     # --- Save results CSV ---
     result = {
+        "task": task,
+        "quantile": quantile if task == "quantile" else None,
         "method": method,
         "mode": mode,
         "softness": softness,
@@ -337,10 +404,15 @@ def main():
         "lr": args.lr,
         "batch_size": args.batch_size,
         "seed": args.seed,
-        "test_acc_em": test_acc["acc_em"] if test_acc else None,
-        "test_acc_ew": test_acc["acc_ew"] if test_acc else None,
-        "test_acc_em5": test_acc["acc_em5"] if test_acc else None,
-        "best_valid_acc_em5": best_valid_acc,
+        # Sort metrics
+        "test_acc_em": test_metrics.get("acc_em") if test_metrics else None,
+        "test_acc_ew": test_metrics.get("acc_ew") if test_metrics else None,
+        "test_acc_em5": test_metrics.get("acc_em5") if test_metrics else None,
+        "best_valid_acc_em5": best_val_score if task == "sort" else None,
+        # Quantile metrics
+        "test_mse": test_metrics.get("mse") if test_metrics else None,
+        "test_spearman": test_metrics.get("spearman") if test_metrics else None,
+        "best_valid_mse": best_val_score if task == "quantile" else None,
     }
     results_df = pd.DataFrame([result])
     header = not os.path.exists(args.results_csv)
