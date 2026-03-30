@@ -1,7 +1,7 @@
 import csv
 from collections import defaultdict
 
-CSV_PATH = "docs/examples/mnist/results3.csv"
+CSV_PATH = "docs/examples/mnist/results.csv"
 
 # Read CSV
 with open(CSV_PATH) as f:
@@ -12,11 +12,11 @@ with open(CSV_PATH) as f:
 methods = list(dict.fromkeys(r["method"] for r in rows))
 num_compares = sorted(set(int(r["num_compare"]) for r in rows))
 
-# Build lookup: (method, num_compare) -> (test_acc_em, test_acc_ew)
+# Build lookup: (method, num_compare) -> (test_mse, test_spearman)
 data = {}
 for r in rows:
     key = (r["method"], int(r["num_compare"]))
-    data[key] = (float(r["test_acc_em"]), float(r["test_acc_ew"]))
+    data[key] = (float(r["test_mse"]), float(r["test_spearman"]))
 
 # Generate LaTeX
 n_cols = len(num_compares)
@@ -34,8 +34,8 @@ for method in methods:
     cells = []
     for nc in num_compares:
         if (method, nc) in data:
-            em, ew = data[(method, nc)]
-            cells.append(f"{em*100:.1f} ({ew*100:.1f})")
+            mse, spear = data[(method, nc)]
+            cells.append(f"{mse*1e-4:.1f} ({spear*100:.1f})")
         else:
             cells.append("--")
     row_label = method.replace("_", r"\_")
@@ -43,6 +43,6 @@ for method in methods:
 
 print(r"\bottomrule")
 print(r"\end{tabular}")
-print(r"\caption{MNIST test accuracy: exact match (element-wise in brackets).}")
+print(r"\caption{MNIST quantile: test MSE (Spearman correlation [\%] in brackets).}")
 print(r"\label{tab:mnist_results}")
 print(r"\end{table}")
