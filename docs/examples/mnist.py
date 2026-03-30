@@ -41,6 +41,11 @@ class MultiDigitDataset(Dataset):
     concatenating ``num_digits`` randomly chosen MNIST digit images along the
     width axis.  The label for each composite image is a multi-digit number
     (e.g. digits 3, 7, 4, 2 -> label 3742).
+    
+    Note that the implementation of this data loader is quite lazy. We pick random 
+    sequences with REPLACEMENT, so the same sequence may appear multiple times in an epoch, 
+    while some sequences may never appear.  This is done to avoid the combinatorial explosion of possible sequences, 
+    which would make it infeasible to pre-generate a fixed dataset of all possible sequences.
     """
 
     def __init__(self, images, labels, num_digits, num_compare, seed=0, determinism=True):
