@@ -3,15 +3,17 @@
 Pipeline (per frame):
 
   1. ``process_model``: model-space vertices → view space → screen-space
-     ``RasterizerPoint`` triples (one per input triangle). Near-plane
-     clipping is omitted; callers must ensure all geometry lies in front
-     of the camera.
+     ``RasterizerPoint`` triples (one per input triangle). Vectorised
+     over vertices with ``jax.vmap``; returns a single
+     ``RasterizerPoint`` pytree whose leaves carry leading axis
+     ``(n_tris, 3, ...)``. Near-plane clipping is omitted; callers must
+     ensure all geometry lies in front of the camera.
   2. ``rasterize_triangle``: barycentric coverage test for every pixel →
      perspective-correct interpolation of depth, UV and normals → z-test
-     → pixel shader. The C# version uses bbox loops with per-pixel locks;
-     here we compute coverage for the whole framebuffer and merge with
-     ``jnp.where``.
-  3. ``render``: top-level orchestrator.
+     → pixel shader. ``jnp.where`` merges colour / depth instead of
+     per-pixel locks.
+  3. ``render``: top-level orchestrator. The per-triangle loop is a
+     ``jax.lax.scan`` so the whole pipeline is jit / grad / vmap-friendly.
 """
 
 from typing import Callable, NamedTuple, Sequence
@@ -22,6 +24,10 @@ import jax.numpy as jnp
 # Pixel shader signature: (pixel_xy, tex_coord, normal, depth) -> rgb.
 # All inputs are broadcast over the framebuffer (shape (H, W, ...)).
 Shader = Callable[[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]
+
+# Small clamp used in divisions to keep gradients finite on near-degenerate
+# input (zero-area triangles, near-zero view-space z).
+_EPS = 1e-6
 
 
 # --- Data structures (lightweight stand-ins for the C# Types/) ------------
@@ -60,16 +66,45 @@ class RenderTarget(NamedTuple):
         return self.color_buffer.shape[0]
 
 
-class Model(NamedTuple):
-    vertices: jax.Array    # (3 * n_tris, 3)
-    tex_coords: jax.Array  # (3 * n_tris, 2)
-    normals: jax.Array     # (3 * n_tris, 3)
-    transform: Transform   # model-to-world SE(3) transform 
-    shader: Shader
+@jax.tree_util.register_pytree_node_class
+class Model:
+    """Drawable geometry plus its pixel shader.
+
+    Registered as a pytree with the shader pulled out as auxiliary
+    (static) data — so ``jit`` doesn't try to trace a Python callable
+    and ``vmap`` doesn't try to map over it.
+    """
+
+    def __init__(self, vertices, tex_coords, normals, transform, shader):
+        self.vertices = vertices      # (3 * n_tris, 3)
+        self.tex_coords = tex_coords  # (3 * n_tris, 2)
+        self.normals = normals        # (3 * n_tris, 3)
+        self.transform = transform    # model-to-world Transform
+        self.shader = shader          # Callable (static aux)
+
+    def tree_flatten(self):
+        children = (self.vertices, self.tex_coords, self.normals, self.transform)
+        aux = (self.shader,)
+        return children, aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children, *aux)
+
+    def replace(self, **kwargs):
+        return Model(
+            vertices=kwargs.get("vertices", self.vertices),
+            tex_coords=kwargs.get("tex_coords", self.tex_coords),
+            normals=kwargs.get("normals", self.normals),
+            transform=kwargs.get("transform", self.transform),
+            shader=kwargs.get("shader", self.shader),
+        )
+
 
 class Camera(NamedTuple):
     fov: jax.Array        # scalar, vertical FOV in radians
     transform: Transform  # camera-to-world SE(3) transform
+
 
 class SceneData(NamedTuple):
     camera: Camera
@@ -77,10 +112,10 @@ class SceneData(NamedTuple):
 
 
 class RasterizerPoint(NamedTuple):
-    depth: jax.Array       # scalar
-    screen_pos: jax.Array  # (2,)
-    tex_coords: jax.Array  # (2,)
-    normals: jax.Array     # (3,)
+    depth: jax.Array       # scalar, or batched
+    screen_pos: jax.Array  # (2,), or batched
+    tex_coords: jax.Array  # (2,), or batched
+    normals: jax.Array     # (3,), or batched
 
 
 # --- Math helpers (subset of Maths.cs used in the pipeline) ---------------
@@ -93,16 +128,19 @@ def signed_parallelogram_area(a, b, c):
 
 
 def point_in_triangle(a, b, c, p):
-    """Coverage test + barycentric weights. Back-faces (CCW) are excluded."""
+    """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
+
+    The reciprocal of the signed area is guarded with ``jnp.where`` so
+    that degenerate triangles (``total ≈ 0``) don't backprop ``nan``.
+    """
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
-    total = area_abp + area_bcp + area_cap
-    inv = 1.0 / total
-    weight_a = area_bcp * inv
-    weight_b = area_cap * inv
-    weight_c = area_abp * inv
-    inside = (area_abp >= 0) & (area_bcp >= 0) & (area_cap >= 0) & (total > 0)
+    inv_total = 1.0 / (area_abp + area_bcp + area_cap)
+    weight_a = area_bcp * inv_total
+    weight_b = area_cap * inv_total
+    weight_c = area_abp * inv_total
+    inside = (area_abp >= 0) & (area_bcp >= 0) & (area_cap >= 0) & (area_abp + area_bcp + area_cap   > _EPS)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -132,71 +170,68 @@ def _emit_point(view_point, tex, normal, camera, target):
 
 
 def process_model(model, camera, target):
-    """Transform vertices and project triangles into screen-space ``RasterizerPoint`` triples.
+    """Project ``model`` vertex to a ``RasterizerPoint``.
 
-    Assumes every vertex has positive view-space z (i.e. lies in front of
-    the camera). No near-plane clipping is performed.
+    Returns a single ``RasterizerPoint`` pytree whose leaves carry
+    leading axis ``(n_tris, 3, ...)``. Assumes positive view-space z
+    for every vertex; no near-plane clipping is performed.
     """
-    n_verts = model.vertices.shape[0]
-    out = []
-    for i in range(0, n_verts, 3):
-        triangle = tuple(
-            _emit_point(
-                vertex_to_view(model.vertices[i + k], model.transform, camera),
-                model.tex_coords[i + k],
-                model.normals[i + k],
-                camera, target,
-            )
-            for k in range(3)
-        )
-        out.append(triangle)
-    return out
+
+    def per_vertex(vert, tex, normal):
+        view_point = vertex_to_view(vert, model.transform, camera)
+        return _emit_point(view_point, tex, normal, camera, target)
+
+    flat = jax.vmap(per_vertex)(model.vertices, model.tex_coords, model.normals)
+    n_tris = model.vertices.shape[0] // 3
+    return jax.tree.map(
+        lambda x: x.reshape((n_tris, 3) + x.shape[1:]),
+        flat,
+    )
 
 
 # --- Triangle rasterization -----------------------------------------------
 
 
 def _pixel_grid(height, width):
-    """Generate a (H, W, 2) array of pixel coordinates, 
-    where pixel centers are at integer + 0.5.
-    Last dimension stores color and depth values."""
+    """(H, W, 2) array of pixel centres (integer + 0.5)."""
     ys, xs = jnp.mgrid[0:height, 0:width]
     return jnp.stack(
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
-    ) 
+    )
 
 
-def rasterize_triangle(rp0, rp1, rp2, color_buf, depth_buf, shader):
-    """Rasterize one triangle and return updated (color_buf, depth_buf).
+def rasterize_triangle(triangle, color_buf, depth_buf, shader):
+    """Rasterize one triangle into ``(color_buf, depth_buf)``.
 
-    Equivalent to the inner Parallel. For body in Rasterizer.cs::Render, but
-    without per-pixel locks: depth + color merge is done with ``jnp.where``.
+    ``triangle`` is a ``RasterizerPoint`` whose leaves carry a leading
+    axis of size 3 — one entry per triangle vertex. Returns the
+    updated buffers. Depth + colour merge is done with ``jnp.where``
+    in place of the C# version's per-pixel locks.
     """
     h, w = color_buf.shape[:2]
-    a, b, c = rp0.screen_pos, rp1.screen_pos, rp2.screen_pos
+    a = triangle.screen_pos[0]
+    b = triangle.screen_pos[1]
+    c = triangle.screen_pos[2]
 
-    # Reciprocal depths and per-vertex attributes pre-divided by depth, so
+    # Reciprocal depths + per-vertex attributes pre-divided by depth so
     # that linear interpolation in screen space becomes perspective-correct.
-    inv_depths = jnp.stack([1.0 / rp0.depth, 1.0 / rp1.depth, 1.0 / rp2.depth])
-    tex_over_z = jnp.stack([rp0.tex_coords * inv_depths[0],
-                            rp1.tex_coords * inv_depths[1],
-                            rp2.tex_coords * inv_depths[2]])  # (3, 2)
-    nrm_over_z = jnp.stack([rp0.normals * inv_depths[0],
-                            rp1.normals * inv_depths[1],
-                            rp2.normals * inv_depths[2]])     # (3, 3)
+    safe_depth = jnp.maximum(triangle.depth, _EPS)             # (3,)
+    inv_depths = 1.0 / safe_depth                              # (3,)
+    tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
+    nrm_over_z = triangle.normals    * inv_depths[:, None]     # (3, 3)
 
-    p = _pixel_grid(h, w)  # (H, W, 2)
-    inside, wa, wb, wc = point_in_triangle(a, b, c, p)         # each (H, W)
+    p = _pixel_grid(h, w)                                       # (H, W, 2)
+    inside, wa, wb, wc = point_in_triangle(a, b, c, p)          # each (H, W)
 
-    # depth = 1 / interp(1/z)
-    depth = 1.0 / (inv_depths[0] * wa + inv_depths[1] * wb + inv_depths[2] * wc)
-
-    # attr = interp(attr / z) * depth
-    weights = jnp.stack([wa, wb, wc], axis=-1)                 # (H, W, 3)
+    weights = jnp.stack([wa, wb, wc], axis=-1)                  # (H, W, 3)
+    inv_z_per_pixel = weights @ inv_depths                       # (H, W)
+    safe_inv_z = jnp.where(jnp.abs(inv_z_per_pixel) > _EPS,
+                           inv_z_per_pixel, 1.0)
+    depth = 1.0 / safe_inv_z
     tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
     normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
 
-    new_color = shader(p, tex_coord, normal, depth)            # (H, W, 3)
+    new_color = shader(p, tex_coord, normal, depth)             # (H, W, 3)
 
     write = inside & (depth < depth_buf)
     color_out = jnp.where(write[..., None], new_color, color_buf)
@@ -208,16 +243,30 @@ def rasterize_triangle(rp0, rp1, rp2, color_buf, depth_buf, shader):
 
 
 def render(target, scene_data):
-    """Render ``scene_data`` into ``target``; returns a new RenderTarget."""
+    """Render ``scene_data`` into ``target``; returns a new RenderTarget.
+
+    Per model: project vertices → run a ``jax.lax.scan`` over its
+    ``n_tris`` triangles carrying the colour / depth buffers. The
+    outer loop over models is plain Python (typically tiny and static).
+    """
     camera = scene_data.camera
     color_buf = target.color_buffer
     depth_buf = target.depth_buffer
 
     for model in scene_data.models:
-        for rp0, rp1, rp2 in process_model(model, camera, target):
+        triangles = process_model(model, camera, target)
+        shader = model.shader
+
+        def scan_body(carry, tri):
+            color_buf, depth_buf = carry
             color_buf, depth_buf = rasterize_triangle(
-                rp0, rp1, rp2, color_buf, depth_buf, model.shader,
+                tri, color_buf, depth_buf, shader,
             )
+            return (color_buf, depth_buf), None
+
+        (color_buf, depth_buf), _ = jax.lax.scan(
+            scan_body, (color_buf, depth_buf), triangles,
+        )
 
     return RenderTarget(color_buffer=color_buf, depth_buffer=depth_buf)
 
@@ -228,7 +277,7 @@ def render(target, scene_data):
 def _load_obj(path):
     """Minimal OBJ loader. Triangulates polygons via fan and returns
     (vertices, normals, tex_coords) as ``(3 * n_tris, ...)`` arrays."""
-    
+
     # TODO: Add check for OBJ convention is CCW front-facing.
     print(f"Loading OBJ file from {path}...")
     print("Warning: this is a minimal loader for demo purposes assuming OBJ convention is CCW front-facing.")
@@ -297,29 +346,70 @@ def main():
     )
 
     scale = jnp.asarray(1.5, dtype=jnp.float32)
-    angles_deg = [0, 60, 120, 180, 240, 300]
-    color_images = []
-    depth_images = []
-    for deg in angles_deg:
+
+    def make_scene(angle_rad):
         model = Model(
             vertices=vertices,
             tex_coords=tex_coords,
             normals=normals,
             transform=Transform(
                 position=jnp.zeros(3),
-                rotation=_rotation_y(jnp.deg2rad(deg)),
+                rotation=_rotation_y(angle_rad),
                 scale=scale,
             ),
             shader=_normal_shader,
         )
-        target = RenderTarget(
+        return SceneData(camera=camera, models=[model])
+
+    def empty_target():
+        return RenderTarget(
             color_buffer=jnp.zeros((H, W, 3)),
             depth_buffer=jnp.full((H, W), jnp.inf),
         )
-        result = render(target, SceneData(camera=camera, models=[model]))
+
+    angles_deg = jnp.array([0.0, 60.0, 120.0, 180.0, 240.0, 300.0])
+    angles_rad = jnp.deg2rad(angles_deg)
+
+    # --- Eager per-angle render (also used as ground truth below) ---
+    color_images = []
+    depth_images = []
+    for ang in angles_rad:
+        result = render(empty_target(), make_scene(ang))
         color_images.append(result.color_buffer)
         depth_images.append(result.depth_buffer)
-        
+
+    # --- Smoke tests: jit / grad / vmap ---------------------------------
+
+    print("Smoke test: jit(render) matches eager render...")
+    render_jit = jax.jit(render)
+    result_jit = render_jit(empty_target(), make_scene(angles_rad[0]))
+    diff_jit = float(jnp.max(jnp.abs(color_images[0] - result_jit.color_buffer)))
+    print(f"  max |Δcolor| = {diff_jit:.2e}  {'OK' if diff_jit < 1e-4 else 'FAIL'}")
+
+    print("Smoke test: jax.grad of mean(color) wrt camera position...")
+    def loss_camera(cam_pos):
+        cam = Camera(
+            fov=camera.fov,
+            transform=Transform(
+                position=cam_pos,
+                rotation=camera.transform.rotation,
+            ),
+        )
+        scene = SceneData(camera=cam, models=make_scene(angles_rad[0]).models)
+        return jnp.mean(render(empty_target(), scene).color_buffer)
+    grad_cam = jax.grad(loss_camera)(camera.transform.position)
+    print(f"  grad = {grad_cam}  finite={bool(jnp.all(jnp.isfinite(grad_cam)))}")
+
+    print("Smoke test: vmap(render) over a batch of rotation angles...")
+    def render_at_angle(angle_rad):
+        return render(empty_target(), make_scene(angle_rad)).color_buffer
+    batched_colors = jax.vmap(render_at_angle)(angles_rad)
+    eager_stack = jnp.stack(color_images)
+    diff_vmap = float(jnp.max(jnp.abs(batched_colors - eager_stack)))
+    print(f"  max |Δvmap-vs-loop| = {diff_vmap:.2e}  {'OK' if diff_vmap < 1e-4 else 'FAIL'}")
+
+    # --- Plot ----------------------------------------------------------
+
     n_cols = len(angles_deg)
     fig, axes = plt.subplots(
         2, n_cols,
@@ -337,7 +427,7 @@ def main():
     # Colour row.
     for ax, img, deg in zip(axes[0], color_images, angles_deg):
         ax.imshow(jnp.clip(img, 0.0, 1.0))
-        ax.set_title(f"{deg}°")
+        ax.set_title(f"{float(deg):.0f}°")
         _strip_ticks(ax)
     axes[0, 0].set_ylabel("color", fontsize=12)
 
@@ -350,7 +440,6 @@ def main():
         _strip_ticks(ax)
     axes[1, 0].set_ylabel("depth", fontsize=12)
 
-    # Shared colourbar for the depth row.
     fig.colorbar(im, ax=axes[1, :].tolist(), shrink=0.85, label="view-space z")
 
     plt.savefig("./rendered_cubes.png", dpi=150, bbox_inches="tight")
@@ -358,4 +447,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
