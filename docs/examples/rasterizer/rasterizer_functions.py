@@ -281,7 +281,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "dragon.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -294,7 +294,7 @@ def main():
         ),
     )
 
-    scale = jnp.asarray(0.3, dtype=jnp.float32)
+    scale = jnp.asarray(1.5, dtype=jnp.float32)
     angles_deg = [0, 60, 120, 180, 240, 300]
     color_images = []
     depth_images = []
@@ -318,17 +318,40 @@ def main():
         color_images.append(result.color_buffer)
         depth_images.append(result.depth_buffer)
         
-    fig, axes = plt.subplots(2, len(angles_deg), figsize=(3 * len(angles_deg), 3))
+    n_cols = len(angles_deg)
+    fig, axes = plt.subplots(
+        2, n_cols,
+        figsize=(2.2 * n_cols, 4.8),
+        constrained_layout=True,
+    )
+    fig.suptitle(f"Cube rendered at scale ×{float(scale):.2f}", fontsize=14)
+
+    def _strip_ticks(ax):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    # Colour row.
     for ax, img, deg in zip(axes[0], color_images, angles_deg):
         ax.imshow(jnp.clip(img, 0.0, 1.0))
-        ax.set_title(f"{deg}°, ×{scale}")
-        ax.set_axis_off()
-    for ax, img, deg in zip(axes[1], depth_images, angles_deg):
-        ax.imshow(jnp.clip(img, 0.0, 1.0))
-        ax.set_title(f"{deg}°, ×{scale}")
-        ax.set_axis_off()
-    plt.tight_layout()
-    plt.savefig("./rendered_cubes.png")
+        ax.set_title(f"{deg}°")
+        _strip_ticks(ax)
+    axes[0, 0].set_ylabel("color", fontsize=12)
+
+    # Depth row: share vmin/vmax so head-on frames don't get noise-amplified.
+    finite_depths = [jnp.where(jnp.isfinite(d), d, jnp.nan) for d in depth_images]
+    vmin = float(jnp.nanmin(jnp.stack([jnp.nanmin(d) for d in finite_depths])))
+    vmax = float(jnp.nanmax(jnp.stack([jnp.nanmax(d) for d in finite_depths])))
+    for ax, depth in zip(axes[1], finite_depths):
+        im = ax.imshow(depth, cmap="gray", vmin=vmin, vmax=vmax)
+        _strip_ticks(ax)
+    axes[1, 0].set_ylabel("depth", fontsize=12)
+
+    # Shared colourbar for the depth row.
+    fig.colorbar(im, ax=axes[1, :].tolist(), shrink=0.85, label="view-space z")
+
+    plt.savefig("./rendered_cubes.png", dpi=150, bbox_inches="tight")
 
 
 if __name__ == "__main__":
