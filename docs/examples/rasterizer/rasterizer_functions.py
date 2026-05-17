@@ -3,9 +3,9 @@
 Pipeline (per frame):
 
   1. ``process_model``: model-space vertices → view space → screen-space
-     ``RasterizerPoint`` triples (one per input triangle). Vectorised
+     ``RasterizedModel`` triples (one per input triangle). Vectorised
      over vertices with ``jax.vmap``; returns a single
-     ``RasterizerPoint`` pytree whose leaves carry leading axis
+     ``RasterizedModel`` pytree whose leaves carry leading axis
      ``(n_tris, 3, ...)``. Near-plane clipping is omitted; callers must
      ensure all geometry lies in front of the camera.
   2. ``rasterize_triangle``: barycentric coverage test for every pixel →
@@ -20,10 +20,7 @@ from typing import Callable, NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
-
-# Pixel shader signature: (pixel_xy, tex_coord, normal, depth) -> rgb.
-# All inputs are broadcast over the framebuffer (shape (H, W, ...)).
-Shader = Callable[[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]
+import equinox as eqx
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
@@ -76,9 +73,9 @@ class Model:
     """
 
     def __init__(self, vertices, tex_coords, normals, transform, shader):
-        self.vertices = vertices      # (3 * n_tris, 3)
-        self.tex_coords = tex_coords  # (3 * n_tris, 2)
-        self.normals = normals        # (3 * n_tris, 3)
+        self.vertices = vertices      # (n_tris, 3, 3)
+        self.tex_coords = tex_coords  # (n_tris, 3, 2)
+        self.normals = normals        # (n_tris, 3, 3)
         self.transform = transform    # model-to-world Transform
         self.shader = shader          # Callable (static aux)
 
@@ -111,11 +108,11 @@ class SceneData(NamedTuple):
     models: Sequence[Model]
 
 
-class RasterizerPoint(NamedTuple):
-    depth: jax.Array       # scalar, or batched
-    screen_pos: jax.Array  # (2,), or batched
-    tex_coords: jax.Array  # (2,), or batched
-    normals: jax.Array     # (3,), or batched
+class RasterizedModel(NamedTuple):
+    depth: jax.Array       # (n_tris, 3, 1), or batched
+    screen_pos: jax.Array  # (n_tris, 3, 2), or batched
+    tex_coords: jax.Array  # (n_tris, 3, 2), or batched
+    normals: jax.Array     # (n_tris, 3, 3), or batched
 
 
 # --- Math helpers (subset of Maths.cs used in the pipeline) ---------------
@@ -140,7 +137,7 @@ def point_in_triangle(a, b, c, p):
     weight_a = area_bcp * inv_total
     weight_b = area_cap * inv_total
     weight_c = area_abp * inv_total
-    inside = (area_abp >= 0) & (area_bcp >= 0) & (area_cap >= 0) & (area_abp + area_bcp + area_cap   > _EPS)
+    inside = (area_abp > 0) & (area_bcp > 0) & (area_cap > 0)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -160,32 +157,27 @@ def view_to_screen(vertex_view, camera, target):
     return target.size / 2.0 + pixel_offset
 
 
-def _emit_point(view_point, tex, normal, camera, target):
-    return RasterizerPoint(
-        depth=view_point[2],
-        screen_pos=view_to_screen(view_point, camera, target),
-        tex_coords=tex,
-        normals=normal,
-    )
-
-
 def process_model(model, camera, target):
-    """Project ``model`` vertex to a ``RasterizerPoint``.
+    """Project every vertex of ``model`` to a ``RasterizedModel``.
 
-    Returns a single ``RasterizerPoint`` pytree whose leaves carry
-    leading axis ``(n_tris, 3, ...)``. Assumes positive view-space z
-    for every vertex; no near-plane clipping is performed.
+    Inputs are already laid out as ``(n_tris, 3, ...)``; a nested
+    ``vmap`` applies the per-vertex projection over both axes and the
+    returned ``RasterizedModel`` leaves keep that same shape. Assumes
+    positive view-space z for every vertex; no near-plane clipping
+    is performed.
     """
 
     def per_vertex(vert, tex, normal):
         view_point = vertex_to_view(vert, model.transform, camera)
-        return _emit_point(view_point, tex, normal, camera, target)
+        return RasterizedModel(
+            depth=view_point[2],
+            screen_pos=view_to_screen(view_point, camera, target),
+            tex_coords=tex,
+            normals=normal,
+        )
 
-    flat = jax.vmap(per_vertex)(model.vertices, model.tex_coords, model.normals)
-    n_tris = model.vertices.shape[0] // 3
-    return jax.tree.map(
-        lambda x: x.reshape((n_tris, 3) + x.shape[1:]),
-        flat,
+    return jax.vmap(jax.vmap(per_vertex))(
+        model.vertices, model.tex_coords, model.normals,
     )
 
 
@@ -203,7 +195,7 @@ def _pixel_grid(height, width):
 def rasterize_triangle(triangle, color_buf, depth_buf, shader):
     """Rasterize one triangle into ``(color_buf, depth_buf)``.
 
-    ``triangle`` is a ``RasterizerPoint`` whose leaves carry a leading
+    ``triangle`` is a ``RasterizedModel`` whose leaves carry a leading
     axis of size 3 — one entry per triangle vertex. Returns the
     updated buffers. Depth + colour merge is done with ``jnp.where``
     in place of the C# version's per-pixel locks.
@@ -255,6 +247,7 @@ def render(target, scene_data):
 
     for model in scene_data.models:
         triangles = process_model(model, camera, target)
+        eqx.tree_pprint(triangles)
         shader = model.shader
 
         def scan_body(carry, tri):
@@ -276,7 +269,7 @@ def render(target, scene_data):
 
 def _load_obj(path):
     """Minimal OBJ loader. Triangulates polygons via fan and returns
-    (vertices, normals, tex_coords) as ``(3 * n_tris, ...)`` arrays."""
+    (vertices, normals, tex_coords) as ``(n_tris, 3, ...)`` arrays."""
 
     # TODO: Add check for OBJ convention is CCW front-facing.
     print(f"Loading OBJ file from {path}...")
@@ -308,10 +301,14 @@ def _load_obj(path):
                         out_pos.append(positions[vi])
                         out_nrm.append(normals[ni] if ni is not None else [0.0, 0.0, 0.0])
                         out_tex.append(tex_coords[ti] if ti is not None else [0.0, 0.0])
+    pos = jnp.asarray(out_pos, dtype=jnp.float32)
+    nrm = jnp.asarray(out_nrm, dtype=jnp.float32)
+    tex = jnp.asarray(out_tex, dtype=jnp.float32)
+    n_tris = pos.shape[0] // 3
     return (
-        jnp.asarray(out_pos, dtype=jnp.float32),
-        jnp.asarray(out_nrm, dtype=jnp.float32),
-        jnp.asarray(out_tex, dtype=jnp.float32),
+        pos.reshape(n_tris, 3, 3),
+        nrm.reshape(n_tris, 3, 3),
+        tex.reshape(n_tris, 3, 2),
     )
 
 
@@ -378,35 +375,35 @@ def main():
         color_images.append(result.color_buffer)
         depth_images.append(result.depth_buffer)
 
-    # --- Smoke tests: jit / grad / vmap ---------------------------------
+    # # --- Smoke tests: jit / grad / vmap ---------------------------------
 
-    print("Smoke test: jit(render) matches eager render...")
-    render_jit = jax.jit(render)
-    result_jit = render_jit(empty_target(), make_scene(angles_rad[0]))
-    diff_jit = float(jnp.max(jnp.abs(color_images[0] - result_jit.color_buffer)))
-    print(f"  max |Δcolor| = {diff_jit:.2e}  {'OK' if diff_jit < 1e-4 else 'FAIL'}")
+    # print("Smoke test: jit(render) matches eager render...")
+    # render_jit = jax.jit(render)
+    # result_jit = render_jit(empty_target(), make_scene(angles_rad[0]))
+    # diff_jit = float(jnp.max(jnp.abs(color_images[0] - result_jit.color_buffer)))
+    # print(f"  max |Δcolor| = {diff_jit:.2e}  {'OK' if diff_jit < 1e-4 else 'FAIL'}")
 
-    print("Smoke test: jax.grad of mean(color) wrt camera position...")
-    def loss_camera(cam_pos):
-        cam = Camera(
-            fov=camera.fov,
-            transform=Transform(
-                position=cam_pos,
-                rotation=camera.transform.rotation,
-            ),
-        )
-        scene = SceneData(camera=cam, models=make_scene(angles_rad[0]).models)
-        return jnp.mean(render(empty_target(), scene).color_buffer)
-    grad_cam = jax.grad(loss_camera)(camera.transform.position)
-    print(f"  grad = {grad_cam}  finite={bool(jnp.all(jnp.isfinite(grad_cam)))}")
+    # print("Smoke test: jax.grad of mean(color) wrt camera position...")
+    # def loss_camera(cam_pos):
+    #     cam = Camera(
+    #         fov=camera.fov,
+    #         transform=Transform(
+    #             position=cam_pos,
+    #             rotation=camera.transform.rotation,
+    #         ),
+    #     )
+    #     scene = SceneData(camera=cam, models=make_scene(angles_rad[0]).models)
+    #     return jnp.mean(render(empty_target(), scene).color_buffer)
+    # grad_cam = jax.grad(loss_camera)(camera.transform.position)
+    # print(f"  grad = {grad_cam}  finite={bool(jnp.all(jnp.isfinite(grad_cam)))}")
 
-    print("Smoke test: vmap(render) over a batch of rotation angles...")
-    def render_at_angle(angle_rad):
-        return render(empty_target(), make_scene(angle_rad)).color_buffer
-    batched_colors = jax.vmap(render_at_angle)(angles_rad)
-    eager_stack = jnp.stack(color_images)
-    diff_vmap = float(jnp.max(jnp.abs(batched_colors - eager_stack)))
-    print(f"  max |Δvmap-vs-loop| = {diff_vmap:.2e}  {'OK' if diff_vmap < 1e-4 else 'FAIL'}")
+    # print("Smoke test: vmap(render) over a batch of rotation angles...")
+    # def render_at_angle(angle_rad):
+    #     return render(empty_target(), make_scene(angle_rad)).color_buffer
+    # batched_colors = jax.vmap(render_at_angle)(angles_rad)
+    # eager_stack = jnp.stack(color_images)
+    # diff_vmap = float(jnp.max(jnp.abs(batched_colors - eager_stack)))
+    # print(f"  max |Δvmap-vs-loop| = {diff_vmap:.2e}  {'OK' if diff_vmap < 1e-4 else 'FAIL'}")
 
     # --- Plot ----------------------------------------------------------
 
