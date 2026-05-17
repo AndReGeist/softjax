@@ -217,9 +217,7 @@ def rasterize_triangle(triangle, color_buf, depth_buf, shader):
 
     weights = jnp.stack([wa, wb, wc], axis=-1)                  # (H, W, 3)
     inv_z_per_pixel = weights @ inv_depths                       # (H, W)
-    safe_inv_z = jnp.where(jnp.abs(inv_z_per_pixel) > _EPS,
-                           inv_z_per_pixel, 1.0)
-    depth = 1.0 / safe_inv_z
+    depth = 1.0 / inv_z_per_pixel
     tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
     normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
 
