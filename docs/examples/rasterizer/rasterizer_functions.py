@@ -21,6 +21,7 @@ from typing import NamedTuple, Sequence
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import softjax as sj
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
@@ -124,11 +125,11 @@ def signed_parallelogram_area(a, b, c):
          + (c[..., 1] - a[..., 1]) * (a[..., 0] - b[..., 0])
 
 
-def point_in_triangle(a, b, c, p):
+def point_in_triangle(a, b, c, p, mode, softness):
     """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
 
-    The reciprocal of the signed area is guarded with ``jnp.where`` so
-    that degenerate triangles (``total ≈ 0``) don't backprop ``nan``.
+    Coverage is a soft fuzzy-AND of three sigmoidal half-plane tests;
+    ``inside`` is a SoftBool in [0, 1] of the same shape as ``p``.
     """
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
@@ -137,7 +138,11 @@ def point_in_triangle(a, b, c, p):
     weight_a = area_bcp * inv_total
     weight_b = area_cap * inv_total
     weight_c = area_abp * inv_total
-    inside = (area_abp > 0) & (area_bcp > 0) & (area_cap > 0)
+    inside = sj.all(jnp.stack([
+        sj.greater(area_abp, 0.0, mode=mode, softness=softness),
+        sj.greater(area_bcp, 0.0, mode=mode, softness=softness),
+        sj.greater(area_cap, 0.0, mode=mode, softness=softness),
+    ], axis=-1), axis=-1)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -192,15 +197,16 @@ def _pixel_grid(height, width):
     )
 
 
-def rasterize_triangle(triangle, h, w, shader):
+def rasterize_triangle(triangle, h, w, shader, mode, softness):
     """Shade one triangle over an ``H x W`` pixel grid.
 
     ``triangle`` is a single ``RasterizedModel`` (leaves of shape
     ``(3, ...)`` — one entry per vertex). Computes per-pixel
     barycentric coverage and perspective-correct depth / UV / normal,
     then invokes ``shader``. Returns ``(color, depth, inside)`` of
-    shapes ``(H, W, 3)``, ``(H, W)``, ``(H, W)``. Pure per-triangle:
-    the z-test and buffer merge live in ``render``.
+    shapes ``(H, W, 3)``, ``(H, W)``, ``(H, W)``. ``inside`` is a
+    SoftBool when ``mode != "hard"``. Pure per-triangle: the z-test
+    and buffer merge live in ``render``.
     """
     a = triangle.screen_pos[0]
     b = triangle.screen_pos[1]
@@ -214,7 +220,7 @@ def rasterize_triangle(triangle, h, w, shader):
     nrm_over_z = triangle.normals    * inv_depths[:, None]     # (3, 3)
 
     p = _pixel_grid(h, w)                                       # (H, W, 2)
-    inside, wa, wb, wc = point_in_triangle(a, b, c, p)          # each (H, W)
+    inside, wa, wb, wc = point_in_triangle(a, b, c, p, mode, softness)
 
     weights = jnp.stack([wa, wb, wc], axis=-1)                  # (H, W, 3)
     inv_z_per_pixel = weights @ inv_depths                       # (H, W)
@@ -229,16 +235,17 @@ def rasterize_triangle(triangle, h, w, shader):
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data):
+def render(target, scene_data, mode="hard", softness=None):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
     triangle in parallel (``vmap(rasterize_triangle)``), pick the
-    closest covering triangle for each pixel (``argmin`` on depths
-    masked by ``inside``), then z-test the winner against the running
-    buffers. The outer loop over ``scene_data.models`` stays Python
-    so heterogeneous models / shaders don't force a single trace.
-    Returns a new ``RenderTarget``.
+    closest covering triangle for each pixel (``sj.argmin`` over the
+    triangle axis), then z-test the winner against the running
+    buffers. ``mode`` / ``softness`` are forwarded to softjax for the
+    silhouette test and the depth argmin. The outer loop over
+    ``scene_data.models`` stays Python so heterogeneous models /
+    shaders don't force a single trace. Returns a new ``RenderTarget``.
     """
     camera = scene_data.camera
     color_buf = target.color_buffer
@@ -250,24 +257,37 @@ def render(target, scene_data):
 
         # (n_tris, H, W, 3), (n_tris, H, W), (n_tris, H, W)
         colors, depths, insides = jax.vmap(
-            lambda tri: rasterize_triangle(tri, h, w, model.shader)
+            lambda tri: rasterize_triangle(tri, h, w, model.shader, mode, softness)
         )(projected_triangles)
 
-        # Disqualify pixels outside their triangle by pushing depth to +inf.
-        masked_depths = jnp.where(insides, depths, jnp.inf)
+        # Disqualify pixels outside their triangle by pushing depth to
+        # a large sentinel (not jnp.inf — softmin on inf is numerically
+        # nasty). With insides in [0, 1], soft `where` blends linearly.
+        masked_depths = sj.where(insides, depths, 1000.0)
 
-        # Closest covering triangle per pixel.
-        winner = jnp.argmin(masked_depths, axis=0)               # (H, W)
+        # winner has shape (H, W, n_tris): the soft one-hot's [n_tris]
+        # axis is appended at the end by softjax convention.
+        winner = sj.argmin(
+            masked_depths, axis=0, mode=mode, softness=softness,
+        )
 
-        win_depth = jnp.take_along_axis(
+        # sj.take_along_axis contract: soft_index has shape
+        # (k, ..., [n]), so the gather axis dim must sit at -1. For
+        # the depth gather (rank-3 source), winner[None] = (1, H, W,
+        # n_tris) is already right. For the colour gather (rank-4
+        # source with a trailing C=3 axis), insert a broadcast-1
+        # axis just before [n] so the contract holds.
+        win_depth = sj.take_along_axis(
             masked_depths, winner[None], axis=0,
         )[0]                                                      # (H, W)
-        win_color = jnp.take_along_axis(
-            colors, winner[None, ..., None], axis=0,
+        win_color = sj.take_along_axis(
+            colors, winner[None, ..., None, :], axis=0,
         )[0]                                                      # (H, W, 3)
 
-        # If no triangle covered a pixel, win_depth == +inf, so the
-        # comparison below is False and the existing buffer is kept.
+        # Pixels with no covering triangle get win_depth close to
+        # 1000 (the sentinel above), which loses the z-test against
+        # any real surface and against the default inf buffer
+        # initialisation, so they keep whatever was there.
         write = win_depth < depth_buf
         color_buf = jnp.where(write[..., None], win_color, color_buf)
         depth_buf = jnp.where(write,            win_depth, depth_buf)
