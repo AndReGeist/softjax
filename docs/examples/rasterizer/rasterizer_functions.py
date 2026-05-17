@@ -212,9 +212,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
     b = triangle.screen_pos[1]
     c = triangle.screen_pos[2]
 
-    # Reciprocal depths + per-vertex attributes pre-divided by depth so
-    # that linear interpolation in screen space becomes perspective-correct.
-    safe_depth = jnp.maximum(triangle.depth, _EPS)             # (3,)
+    # Ensure linear interpolation in screen space becomes perspective-correct.
+    safe_depth = jnp.where(jnp.less(triangle.depth, _EPS), 1000.0, triangle.depth)             # (3,)
     inv_depths = 1.0 / safe_depth                              # (3,)
     tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
     nrm_over_z = triangle.normals    * inv_depths[:, None]     # (3, 3)
@@ -248,10 +247,8 @@ def render(target, scene_data, mode="hard", softness=None):
     shaders don't force a single trace. Returns a new ``RenderTarget``.
     """
     camera = scene_data.camera
-    color_buf = target.color_buffer
-    depth_buf = target.depth_buffer
-    h, w = color_buf.shape[:2]
-
+    h, w = target.color_buffer.shape[:2]
+    
     for model in scene_data.models:
         projected_triangles = process_model(model, camera, target)
 
@@ -260,10 +257,8 @@ def render(target, scene_data, mode="hard", softness=None):
             lambda tri: rasterize_triangle(tri, h, w, model.shader, mode, softness)
         )(projected_triangles)
 
-        # Disqualify pixels outside their triangle by pushing depth to
-        # a large sentinel (not jnp.inf — softmin on inf is numerically
-        # nasty). With insides in [0, 1], soft `where` blends linearly.
-        masked_depths = sj.where(insides, depths, 1000.0)
+        safe_depths = jnp.where(jnp.isfinite(depths), depths, 10000.0)
+        masked_depths = sj.where(insides, safe_depths, 10000.0)
 
         # winner has shape (H, W, n_tris): the soft one-hot's [n_tris]
         # axis is appended at the end by softjax convention.
@@ -272,27 +267,24 @@ def render(target, scene_data, mode="hard", softness=None):
         )
 
         # sj.take_along_axis contract: soft_index has shape
-        # (k, ..., [n]), so the gather axis dim must sit at -1. For
-        # the depth gather (rank-3 source), winner[None] = (1, H, W,
-        # n_tris) is already right. For the colour gather (rank-4
-        # source with a trailing C=3 axis), insert a broadcast-1
-        # axis just before [n] so the contract holds.
+        # (k, ..., [n]), so the gather axis dim must sit at -1.
         win_depth = sj.take_along_axis(
             masked_depths, winner[None], axis=0,
-        )[0]                                                      # (H, W)
+        )[0]                                                    # (H, W)
         win_color = sj.take_along_axis(
             colors, winner[None, ..., None, :], axis=0,
-        )[0]                                                      # (H, W, 3)
+        )[0]                                                    # (H, W, 3)
 
-        # Pixels with no covering triangle get win_depth close to
-        # 1000 (the sentinel above), which loses the z-test against
-        # any real surface and against the default inf buffer
-        # initialisation, so they keep whatever was there.
-        write = win_depth < depth_buf
-        color_buf = jnp.where(write[..., None], win_color, color_buf)
-        depth_buf = jnp.where(write,            win_depth, depth_buf)
+        #coverage = jnp.max(insides, axis=0)                       # (H, W)
+        #write = win_depth < depth_buf                              # (H, W)
+        #alpha = coverage * write.astype(coverage.dtype)           # (H, W)
+        #color_buf = sj.where(alpha[..., None], win_color, color_buf)
+        # Depth: a single scalar per pixel has no meaningful soft
+        # blend against +inf, so use a hard threshold on coverage.
+        #depth_write = write & (coverage > 0.5)
+        #depth_buf = jnp.where(depth_write, win_depth, depth_buf)
 
-    return RenderTarget(color_buffer=color_buf, depth_buffer=depth_buf)
+    return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
 
 
 # --- Demo: load cube.obj and render at several rotations ------------------
@@ -463,6 +455,7 @@ def main():
     finite_depths = [jnp.where(jnp.isfinite(d), d, jnp.nan) for d in depth_images]
     vmin = float(jnp.nanmin(jnp.stack([jnp.nanmin(d) for d in finite_depths])))
     vmax = float(jnp.nanmax(jnp.stack([jnp.nanmax(d) for d in finite_depths])))
+    print(vmin, vmax)
     for ax, depth in zip(axes[1], finite_depths):
         im = ax.imshow(depth, cmap="gray", vmin=vmin, vmax=vmax)
         _strip_ticks(ax)
