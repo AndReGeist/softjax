@@ -192,15 +192,15 @@ def _pixel_grid(height, width):
     )
 
 
-def rasterize_triangle(triangle, color_buf, depth_buf, shader):
-    """Rasterize one triangle into ``(color_buf, depth_buf)``.
+def rasterize_triangle(triangle, h, w, shader):
+    """Per-pixel colour, depth, and coverage for ONE triangle.
 
     ``triangle`` is a ``RasterizedModel`` whose leaves carry a leading
-    axis of size 3 — one entry per triangle vertex. Returns the
-    updated buffers. Depth + colour merge is done with ``jnp.where``
-    in place of the C# version's per-pixel locks.
+    axis of size 3 — one entry per triangle vertex. Returns
+    ``(color, depth, inside)`` with shapes ``(H, W, 3)``, ``(H, W)``,
+    ``(H, W)``. No buffer merge — ``render`` does that once after
+    the per-triangle vmap.
     """
-    h, w = color_buf.shape[:2]
     a = triangle.screen_pos[0]
     b = triangle.screen_pos[1]
     c = triangle.screen_pos[2]
@@ -221,12 +221,8 @@ def rasterize_triangle(triangle, color_buf, depth_buf, shader):
     tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
     normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
 
-    new_color = shader(p, tex_coord, normal, depth)             # (H, W, 3)
-
-    write = inside & (depth < depth_buf)
-    color_out = jnp.where(write[..., None], new_color, color_buf)
-    depth_out = jnp.where(write, depth, depth_buf)
-    return color_out, depth_out
+    color = shader(p, tex_coord, normal, depth)                 # (H, W, 3)
+    return color, depth, inside
 
 
 # --- Top-level render -----------------------------------------------------
@@ -235,29 +231,42 @@ def rasterize_triangle(triangle, color_buf, depth_buf, shader):
 def render(target, scene_data):
     """Render ``scene_data`` into ``target``; returns a new RenderTarget.
 
-    Per model: project vertices → run a ``jax.lax.scan`` over its
-    ``n_tris`` triangles carrying the colour / depth buffers. The
-    outer loop over models is plain Python (typically tiny and static).
+    Per model: project vertices → ``vmap`` ``rasterize_triangle`` over
+    all triangles in parallel → reduce per pixel via argmin on masked
+    depth → merge once against the running buffers. The outer loop
+    over models is plain Python (typically tiny and static).
     """
     camera = scene_data.camera
     color_buf = target.color_buffer
     depth_buf = target.depth_buffer
+    h, w = color_buf.shape[:2]
 
     for model in scene_data.models:
-        triangles = process_model(model, camera, target)
-        eqx.tree_pprint(triangles)
-        shader = model.shader
+        projected_triangles = process_model(model, camera, target)
 
-        def scan_body(carry, tri):
-            color_buf, depth_buf = carry
-            color_buf, depth_buf = rasterize_triangle(
-                tri, color_buf, depth_buf, shader,
-            )
-            return (color_buf, depth_buf), None
+        # (n_tris, H, W, 3), (n_tris, H, W), (n_tris, H, W)
+        colors, depths, insides = jax.vmap(
+            lambda tri: rasterize_triangle(tri, h, w, model.shader)
+        )(projected_triangles)
 
-        (color_buf, depth_buf), _ = jax.lax.scan(
-            scan_body, (color_buf, depth_buf), triangles,
-        )
+        # Disqualify pixels outside their triangle by pushing depth to +inf.
+        masked_depths = jnp.where(insides, depths, jnp.inf)
+
+        # Closest covering triangle per pixel.
+        winner = jnp.argmin(masked_depths, axis=0)               # (H, W)
+
+        win_depth = jnp.take_along_axis(
+            masked_depths, winner[None], axis=0,
+        )[0]                                                      # (H, W)
+        win_color = jnp.take_along_axis(
+            colors, winner[None, ..., None], axis=0,
+        )[0]                                                      # (H, W, 3)
+
+        # If no triangle covered a pixel, win_depth == +inf, so the
+        # comparison below is False and the existing buffer is kept.
+        write = win_depth < depth_buf
+        color_buf = jnp.where(write[..., None], win_color, color_buf)
+        depth_buf = jnp.where(write,            win_depth, depth_buf)
 
     return RenderTarget(color_buffer=color_buf, depth_buffer=depth_buf)
 
