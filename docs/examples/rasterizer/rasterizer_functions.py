@@ -34,9 +34,11 @@ class Transform(NamedTuple):
     scale: jax.Array = jnp.float32(1.0)  # scalar, uniform scale factor
 
     def to_world_point(self, p):
+        """Local to world transform."""
         return self.rotation @ (self.scale * p) + self.position
 
     def to_local_point(self, p):
+        """World to local transform."""
         return self.rotation.T @ (p - self.position) / self.scale
 
 
