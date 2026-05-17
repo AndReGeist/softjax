@@ -16,7 +16,7 @@ Pipeline (per frame):
      ``jax.lax.scan`` so the whole pipeline is jit / grad / vmap-friendly.
 """
 
-from typing import Callable, NamedTuple, Sequence
+from typing import NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
