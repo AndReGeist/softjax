@@ -213,8 +213,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
     c = triangle.screen_pos[2]
 
     # Ensure linear interpolation in screen space becomes perspective-correct.
-    safe_depth = jnp.where(jnp.less(triangle.depth, _EPS), 1000.0, triangle.depth)             # (3,)
-    inv_depths = 1.0 / safe_depth                              # (3,)
+    #safe_depth = jnp.where(jnp.less(triangle.depth, _EPS), 1000.0, triangle.depth)             # (3,)
+    inv_depths = 1.0 / triangle.depth                              # (3,)
     tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
     nrm_over_z = triangle.normals    * inv_depths[:, None]     # (3, 3)
 
