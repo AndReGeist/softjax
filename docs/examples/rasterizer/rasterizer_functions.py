@@ -193,13 +193,14 @@ def _pixel_grid(height, width):
 
 
 def rasterize_triangle(triangle, h, w, shader):
-    """Per-pixel colour, depth, and coverage for ONE triangle.
+    """Shade one triangle over an ``H x W`` pixel grid.
 
-    ``triangle`` is a ``RasterizedModel`` whose leaves carry a leading
-    axis of size 3 — one entry per triangle vertex. Returns
-    ``(color, depth, inside)`` with shapes ``(H, W, 3)``, ``(H, W)``,
-    ``(H, W)``. No buffer merge — ``render`` does that once after
-    the per-triangle vmap.
+    ``triangle`` is a single ``RasterizedModel`` (leaves of shape
+    ``(3, ...)`` — one entry per vertex). Computes per-pixel
+    barycentric coverage and perspective-correct depth / UV / normal,
+    then invokes ``shader``. Returns ``(color, depth, inside)`` of
+    shapes ``(H, W, 3)``, ``(H, W)``, ``(H, W)``. Pure per-triangle:
+    the z-test and buffer merge live in ``render``.
     """
     a = triangle.screen_pos[0]
     b = triangle.screen_pos[1]
@@ -229,12 +230,15 @@ def rasterize_triangle(triangle, h, w, shader):
 
 
 def render(target, scene_data):
-    """Render ``scene_data`` into ``target``; returns a new RenderTarget.
+    """Composite every model in ``scene_data`` into ``target``.
 
-    Per model: project vertices → ``vmap`` ``rasterize_triangle`` over
-    all triangles in parallel → reduce per pixel via argmin on masked
-    depth → merge once against the running buffers. The outer loop
-    over models is plain Python (typically tiny and static).
+    Per model: project vertices (``process_model``), shade every
+    triangle in parallel (``vmap(rasterize_triangle)``), pick the
+    closest covering triangle for each pixel (``argmin`` on depths
+    masked by ``inside``), then z-test the winner against the running
+    buffers. The outer loop over ``scene_data.models`` stays Python
+    so heterogeneous models / shaders don't force a single trace.
+    Returns a new ``RenderTarget``.
     """
     camera = scene_data.camera
     color_buf = target.color_buffer
