@@ -2,14 +2,15 @@
 
 Pipeline (per frame):
 
-  1. ``process_model``: model-space vertices → view space, then per-triangle
-     near-plane clipping that can split one triangle into 0, 1, or 2 output
-     triangles. Output is a flat list of ``RasterizerPoint`` triples.
-  2. ``rasterize_triangle``: screen-space AABB → barycentric coverage test
-     for every pixel → perspective-correct interpolation of depth, UV and
-     normals → z-test → pixel shader. The C# version uses bbox loops with
-     per-pixel locks; here we compute coverage for the whole framebuffer
-     and merge with ``jnp.where``.
+  1. ``process_model``: model-space vertices → view space → screen-space
+     ``RasterizerPoint`` triples (one per input triangle). Near-plane
+     clipping is omitted; callers must ensure all geometry lies in front
+     of the camera.
+  2. ``rasterize_triangle``: barycentric coverage test for every pixel →
+     perspective-correct interpolation of depth, UV and normals → z-test
+     → pixel shader. The C# version uses bbox loops with per-pixel locks;
+     here we compute coverage for the whole framebuffer and merge with
+     ``jnp.where``.
   3. ``render``: top-level orchestrator.
 """
 
@@ -27,20 +28,16 @@ Shader = Callable[[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]
 
 
 class Transform(NamedTuple):
-    """Affine transform: world = rotation @ local + position."""
+    """Similarity transform: world = rotation @ (scale * local) + position."""
     position: jax.Array  # (3,)
     rotation: jax.Array  # (3, 3) rotation matrix
+    scale: jax.Array = jnp.float32(1.0)  # scalar, uniform scale factor
 
     def to_world_point(self, p):
-        return self.rotation @ p + self.position
+        return self.rotation @ (self.scale * p) + self.position
 
     def to_local_point(self, p):
-        return self.rotation.T @ (p - self.position)
-
-
-class Camera(NamedTuple):
-    fov: jax.Array       # scalar, vertical FOV in radians
-    transform: Transform
+        return self.rotation.T @ (p - self.position) / self.scale
 
 
 class RenderTarget(NamedTuple):
@@ -65,9 +62,12 @@ class Model(NamedTuple):
     vertices: jax.Array    # (3 * n_tris, 3)
     tex_coords: jax.Array  # (3 * n_tris, 2)
     normals: jax.Array     # (3 * n_tris, 3)
-    transform: Transform
+    transform: Transform   # model-to-world SE(3) transform 
     shader: Shader
 
+class Camera(NamedTuple):
+    fov: jax.Array        # scalar, vertical FOV in radians
+    transform: Transform  # camera-to-world SE(3) transform
 
 class SceneData(NamedTuple):
     camera: Camera
@@ -104,10 +104,6 @@ def point_in_triangle(a, b, c, p):
     return inside, weight_a, weight_b, weight_c
 
 
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-
 # --- Vertex transform & projection ----------------------------------------
 
 
@@ -124,11 +120,6 @@ def view_to_screen(vertex_view, camera, target):
     return target.size / 2.0 + pixel_offset
 
 
-# --- Near-plane clipping --------------------------------------------------
-
-NEAR_CLIP_DST = 0.01
-
-
 def _emit_point(view_point, tex, normal, camera, target):
     return RasterizerPoint(
         depth=view_point[2],
@@ -138,74 +129,25 @@ def _emit_point(view_point, tex, normal, camera, target):
     )
 
 
-def _edge_crossing(view_pts, texs, norms, i_anchor, i_other, near):
-    """Interpolate (view, tex, normal) along an edge to the near plane."""
-    z_anchor = view_pts[i_anchor][2]
-    z_other = view_pts[i_other][2]
-    t = (near - z_anchor) / (z_other - z_anchor)
-    return (
-        lerp(view_pts[i_anchor], view_pts[i_other], t),
-        lerp(texs[i_anchor], texs[i_other], t),
-        lerp(norms[i_anchor], norms[i_other], t),
-    )
-
-
-def _clip_triangle(view_pts, texs, norms, camera, target):
-    """Near-plane clip one triangle; returns 0, 1, or 2 output triangles.
-
-    Mirrors the four-case switch in Rasterizer.cs::ProcessModel.
-    """
-    clipped = [bool(v[2] <= NEAR_CLIP_DST) for v in view_pts]
-    n_clipped = sum(clipped)
-
-    if n_clipped == 3:
-        return []
-
-    if n_clipped == 0:
-        return [tuple(
-            _emit_point(view_pts[i], texs[i], norms[i], camera, target)
-            for i in range(3)
-        )]
-
-    if n_clipped == 1:
-        i_clip = clipped.index(True)
-        i_next = (i_clip + 1) % 3
-        i_prev = (i_clip - 1) % 3
-        edge_a_v, edge_a_t, edge_a_n = _edge_crossing(
-            view_pts, texs, norms, i_clip, i_next, NEAR_CLIP_DST)
-        edge_b_v, edge_b_t, edge_b_n = _edge_crossing(
-            view_pts, texs, norms, i_clip, i_prev, NEAR_CLIP_DST)
-        edge_a = _emit_point(edge_a_v, edge_a_t, edge_a_n, camera, target)
-        edge_b = _emit_point(edge_b_v, edge_b_t, edge_b_n, camera, target)
-        v_next = _emit_point(view_pts[i_next], texs[i_next], norms[i_next], camera, target)
-        v_prev = _emit_point(view_pts[i_prev], texs[i_prev], norms[i_prev], camera, target)
-        return [(edge_b, edge_a, v_prev),
-                (edge_a, v_next, v_prev)]
-
-    # n_clipped == 2 — only the lone surviving vertex remains.
-    i_keep = clipped.index(False)
-    i_next = (i_keep + 1) % 3
-    i_prev = (i_keep - 1) % 3
-    edge_a_v, edge_a_t, edge_a_n = _edge_crossing(
-        view_pts, texs, norms, i_keep, i_next, NEAR_CLIP_DST)
-    edge_b_v, edge_b_t, edge_b_n = _edge_crossing(
-        view_pts, texs, norms, i_keep, i_prev, NEAR_CLIP_DST)
-    edge_a = _emit_point(edge_a_v, edge_a_t, edge_a_n, camera, target)
-    edge_b = _emit_point(edge_b_v, edge_b_t, edge_b_n, camera, target)
-    v_keep = _emit_point(view_pts[i_keep], texs[i_keep], norms[i_keep], camera, target)
-    return [(edge_b, v_keep, edge_a)]
-
-
 def process_model(model, camera, target):
-    """Transform vertices and produce a flat list of clipped rasterizer triangles."""
+    """Transform vertices and project triangles into screen-space ``RasterizerPoint`` triples.
+
+    Assumes every vertex has positive view-space z (i.e. lies in front of
+    the camera). No near-plane clipping is performed.
+    """
     n_verts = model.vertices.shape[0]
     out = []
     for i in range(0, n_verts, 3):
-        view_pts = [vertex_to_view(model.vertices[i + k], model.transform, camera)
-                    for k in range(3)]
-        texs = [model.tex_coords[i + k] for k in range(3)]
-        norms = [model.normals[i + k] for k in range(3)]
-        out.extend(_clip_triangle(view_pts, texs, norms, camera, target))
+        triangle = tuple(
+            _emit_point(
+                vertex_to_view(model.vertices[i + k], model.transform, camera),
+                model.tex_coords[i + k],
+                model.normals[i + k],
+                camera, target,
+            )
+            for k in range(3)
+        )
+        out.append(triangle)
     return out
 
 
@@ -213,10 +155,13 @@ def process_model(model, camera, target):
 
 
 def _pixel_grid(height, width):
+    """Generate a (H, W, 2) array of pixel coordinates, 
+    where pixel centers are at integer + 0.5.
+    Last dimension stores color and depth values."""
     ys, xs = jnp.mgrid[0:height, 0:width]
     return jnp.stack(
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
-    )  # (H, W, 2)
+    ) 
 
 
 def rasterize_triangle(rp0, rp1, rp2, color_buf, depth_buf, shader):
@@ -281,6 +226,10 @@ def render(target, scene_data):
 def _load_obj(path):
     """Minimal OBJ loader. Triangulates polygons via fan and returns
     (vertices, normals, tex_coords) as ``(3 * n_tris, ...)`` arrays."""
+    
+    # TODO: Add check for OBJ convention is CCW front-facing.
+    print(f"Loading OBJ file from {path}...")
+    print("Warning: this is a minimal loader for demo purposes assuming OBJ convention is CCW front-facing.")
     positions, normals, tex_coords = [], [], []
     out_pos, out_nrm, out_tex = [], [], []
     with open(path) as f:
@@ -332,7 +281,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "dragon.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -345,8 +294,10 @@ def main():
         ),
     )
 
+    scale = jnp.asarray(0.3, dtype=jnp.float32)
     angles_deg = [0, 60, 120, 180, 240, 300]
-    images = []
+    color_images = []
+    depth_images = []
     for deg in angles_deg:
         model = Model(
             vertices=vertices,
@@ -355,6 +306,7 @@ def main():
             transform=Transform(
                 position=jnp.zeros(3),
                 rotation=_rotation_y(jnp.deg2rad(deg)),
+                scale=scale,
             ),
             shader=_normal_shader,
         )
@@ -363,12 +315,17 @@ def main():
             depth_buffer=jnp.full((H, W), jnp.inf),
         )
         result = render(target, SceneData(camera=camera, models=[model]))
-        images.append(result.color_buffer)
-
-    fig, axes = plt.subplots(1, len(angles_deg), figsize=(3 * len(angles_deg), 3))
-    for ax, img, deg in zip(axes, images, angles_deg):
-        ax.imshow(jnp.asarray(img))
-        ax.set_title(f"{deg}°")
+        color_images.append(result.color_buffer)
+        depth_images.append(result.depth_buffer)
+        
+    fig, axes = plt.subplots(2, len(angles_deg), figsize=(3 * len(angles_deg), 3))
+    for ax, img, deg in zip(axes[0], color_images, angles_deg):
+        ax.imshow(jnp.clip(img, 0.0, 1.0))
+        ax.set_title(f"{deg}°, ×{scale}")
+        ax.set_axis_off()
+    for ax, img, deg in zip(axes[1], depth_images, angles_deg):
+        ax.imshow(jnp.clip(img, 0.0, 1.0))
+        ax.set_title(f"{deg}°, ×{scale}")
         ax.set_axis_off()
     plt.tight_layout()
     plt.savefig("./rendered_cubes.png")
