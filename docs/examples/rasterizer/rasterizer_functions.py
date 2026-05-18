@@ -29,7 +29,7 @@ lj.monkey_patch()
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
-_EPS = 1e-6
+_EPS = 1e-10
 
 
 # --- Data structures (lightweight stand-ins for the C# Types/) ------------
@@ -266,21 +266,8 @@ def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_insi
         lambda tri: rasterize_triangle(tri, h, w, scene_data.models[0].shader, mode, softness_inside)
     )(projected_triangles)
 
-    # Per-pixel soft probability over triangles, based on inverse depth.
-    # sj.argmax(axis=0) returns the soft one-hot with the [n_tris] axis at
-    # the end (shape (H, W, n_tris)); move it back to axis 0 to match
-    # `insides` / `depths` / `colors`.
-    inv_depths = safe_division(1.0, depths)                  # (n_tris, H, W)
-    winner = jnp.moveaxis(
-        sj.argmax(inv_depths, axis=0, mode=mode, softness=softness_depth),
-        -1, 0,
-    )                                                        # (n_tris, H, W)
-
-    # Gate the depth-argmax by coverage, then renormalise per pixel.
-    weights = winner * insides                               # (n_tris, H, W)
-    weights = weights / (jnp.sum(weights, axis=0, keepdims=True) + _EPS)
-
-    # Soft-weighted blend = dot product along the triangle axis.
+    inv_depth = safe_division(1.0, depths)  # (n_tris, H, W)
+    weights = jnp.moveaxis(sj.argmax(inv_depth + jnp.log(insides+_EPS), axis=0, mode=mode, softness=softness_depth), -1, 0)                                           # (n_tris, H, W)
     win_depth = jnp.sum(weights * depths, axis=0)            # (H, W)
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
