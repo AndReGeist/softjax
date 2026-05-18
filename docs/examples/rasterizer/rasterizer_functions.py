@@ -240,7 +240,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data, mode="smooth", softness_depth=1e0, softness_inside=1e0):
+def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e-1):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -266,10 +266,12 @@ def render(target, scene_data, mode="smooth", softness_depth=1e0, softness_insid
         lambda tri: rasterize_triangle(tri, h, w, scene_data.models[0].shader, mode, softness_inside)
     )(projected_triangles)
 
-    inside_inv_depths = sj.where(insides, (1.0 / depths), _EPS)
-    winner = sj.argmax(inside_inv_depths, axis=0, mode=mode, softness=softness_depth)
-    win_depth = sj.take_along_axis(1.0/inside_inv_depths, winner[None], axis=0)[0]                                                    # (H, W)
-    win_color = sj.take_along_axis(colors, winner[None, ..., None, :], axis=0)[0]                                                    # (H, W, 3)
+    inv_depths = safe_division(1.0, depths)
+    winner = sj.argmax(inv_depths, axis=0, mode=mode, softness=softness_depth)
+    winner_unnormalized = insides * winner
+    winner_normed = winner_unnormalized / jnp.sum(winner_unnormalized, axis=0, keepdims=True)
+    win_depth = sj.take_along_axis(1.0/inv_depths, winner_normed[None], axis=0)[0]                                                    # (H, W)
+    win_color = sj.take_along_axis(colors, winner_normed[None, ..., None, :], axis=0)[0]                                                    # (H, W, 3)
 
     return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
 
