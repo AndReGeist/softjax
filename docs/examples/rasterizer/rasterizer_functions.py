@@ -240,7 +240,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e-1):
+def render(target, scene_data, mode="hard", softness_depth=1e-1, softness_inside=1e-1):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -266,8 +266,14 @@ def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_insi
         lambda tri: rasterize_triangle(tri, h, w, scene_data.models[0].shader, mode, softness_inside)
     )(projected_triangles)
 
-    inv_depth = safe_division(1.0, depths)  # (n_tris, H, W)
-    weights = jnp.moveaxis(sj.argmax(inv_depth + jnp.log(insides+_EPS), axis=0, mode=mode, softness=softness_depth), -1, 0)                                           # (n_tris, H, W)
+    def normalize(x):
+        x_min = jnp.min(x, axis=0, keepdims=True)
+        x_max = jnp.max(x, axis=0, keepdims=True)
+        return (x - x_min) / (x_max - x_min) + _EPS
+
+    inv_depth = 1 / depths
+    inv_depth = normalize(inv_depth)
+    weights = jnp.moveaxis(sj.argmax(inv_depth + jnp.log(insides + _EPS), axis=0, mode=mode, softness=softness_depth), -1, 0)                                           # (n_tris, H, W)
     win_depth = jnp.sum(weights * depths, axis=0)            # (H, W)
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
