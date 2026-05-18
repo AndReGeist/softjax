@@ -29,7 +29,7 @@ lj.monkey_patch()
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
-_EPS = 1e-10
+_EPS = 1e-6
 
 
 # --- Data structures (lightweight stand-ins for the C# Types/) ------------
@@ -240,7 +240,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data, mode="hard", softness_depth=1e-1, softness_inside=1e-1):
+def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e-1):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
