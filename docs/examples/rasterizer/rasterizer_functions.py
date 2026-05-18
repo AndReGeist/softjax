@@ -16,12 +16,16 @@ Pipeline (per frame):
      ``jax.lax.scan`` so the whole pipeline is jit / grad / vmap-friendly.
 """
 
+from pyexpat import model
 from typing import NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 import softjax as sj
+
+import lovely_jax as lj
+lj.monkey_patch()
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
@@ -118,6 +122,9 @@ class RasterizedModel(NamedTuple):
 
 # --- Math helpers (subset of Maths.cs used in the pipeline) ---------------
 
+def safe_division(numerator, denominator):
+    """Divide with a small clamp to keep gradients finite on near-zero denominators."""
+    return numerator / jnp.where(jnp.abs(denominator) < _EPS, _EPS, denominator)
 
 def signed_parallelogram_area(a, b, c):
     """2x signed area of triangle abc (positive for clockwise winding)."""
@@ -134,14 +141,15 @@ def point_in_triangle(a, b, c, p, mode, softness):
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
-    inv_total = 1.0 / (area_abp + area_bcp + area_cap)
+    area_total = area_abp + area_bcp + area_cap
+    inv_total = jnp.where(jnp.abs(area_total) < _EPS, 1.0 / _EPS, 1.0 / area_total)
     weight_a = area_bcp * inv_total
     weight_b = area_cap * inv_total
     weight_c = area_abp * inv_total
     inside = sj.all(jnp.stack([
-        sj.greater(area_abp, 0.0, mode=mode, softness=softness),
-        sj.greater(area_bcp, 0.0, mode=mode, softness=softness),
-        sj.greater(area_cap, 0.0, mode=mode, softness=softness),
+        sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness),
+        sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness),
+        sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness),
     ], axis=-1), axis=-1)
     return inside, weight_a, weight_b, weight_c
 
@@ -196,7 +204,6 @@ def _pixel_grid(height, width):
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
     )
 
-
 def rasterize_triangle(triangle, h, w, shader, mode, softness):
     """Shade one triangle over an ``H x W`` pixel grid.
 
@@ -204,37 +211,36 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
     ``(3, ...)`` — one entry per vertex). Computes per-pixel
     barycentric coverage and perspective-correct depth / UV / normal,
     then invokes ``shader``. Returns ``(color, depth, inside)`` of
-    shapes ``(H, W, 3)``, ``(H, W)``, ``(H, W)``. ``inside`` is a
-    SoftBool when ``mode != "hard"``. Pure per-triangle: the z-test
-    and buffer merge live in ``render``.
+    shapes ``(H, W, 3)``, ``(H, W)``, ``(H, W)``.
     """
     a = triangle.screen_pos[0]
     b = triangle.screen_pos[1]
     c = triangle.screen_pos[2]
 
-    # Ensure linear interpolation in screen space becomes perspective-correct.
-    #safe_depth = jnp.where(jnp.less(triangle.depth, _EPS), 1000.0, triangle.depth)             # (3,)
-    inv_depths = 1.0 / triangle.depth                              # (3,)
-    tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
-    nrm_over_z = triangle.normals    * inv_depths[:, None]     # (3, 3)
-
+    # Barycentric weights and Bool if pixel is inside triangle.
     p = _pixel_grid(h, w)                                       # (H, W, 2)
     inside, wa, wb, wc = point_in_triangle(a, b, c, p, mode, softness)
 
-    weights = jnp.stack([wa, wb, wc], axis=-1)                  # (H, W, 3)
-    inv_z_per_pixel = weights @ inv_depths                       # (H, W)
-    depth = 1.0 / inv_z_per_pixel
+    # Ensure linear interpolation in screen space becomes perspective-correct.
+    inv_depths = safe_division(1.0, triangle.depth)            # (3, 1)
+    weights = jnp.stack([wa, wb, wc], axis=-1)   # (H, W, 3)
+    inv_z_per_pixel = weights @ inv_depths       # (H, W)
+    depth = safe_division(1.0, inv_z_per_pixel)  # (H, W)
+    
+    tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
     tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
+    
+    nrm_over_z = triangle.normals * inv_depths[:, None]     # (3, 3)
     normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
 
-    color = shader(p, tex_coord, normal, depth)                 # (H, W, 3)
+    color = shader(p, tex_coord, normal, depth) # (H, W, 3)
     return color, depth, inside
 
 
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data, mode="hard", softness=None):
+def render(target, scene_data, mode="smooth", softness_depth=1e0, softness_inside=1e0):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -249,40 +255,21 @@ def render(target, scene_data, mode="hard", softness=None):
     camera = scene_data.camera
     h, w = target.color_buffer.shape[:2]
     
-    for model in scene_data.models:
-        projected_triangles = process_model(model, camera, target)
+    
+    per_model = [process_model(model_i, camera, target) for model_i in scene_data.models]
+    projected_triangles = jax.tree.map(
+        lambda *xs: jnp.concatenate(xs, axis=0), *per_model,
+    )
 
-        # (n_tris, H, W, 3), (n_tris, H, W), (n_tris, H, W)
-        colors, depths, insides = jax.vmap(
-            lambda tri: rasterize_triangle(tri, h, w, model.shader, mode, softness)
-        )(projected_triangles)
+    # (n_tris, H, W, 3), (n_tris, H, W), (n_tris, H, W)
+    colors, depths, insides = jax.vmap(
+        lambda tri: rasterize_triangle(tri, h, w, scene_data.models[0].shader, mode, softness_inside)
+    )(projected_triangles)
 
-        safe_depths = jnp.where(jnp.isfinite(depths), depths, 10000.0)
-        masked_depths = sj.where(insides, safe_depths, 10000.0)
-
-        # winner has shape (H, W, n_tris): the soft one-hot's [n_tris]
-        # axis is appended at the end by softjax convention.
-        winner = sj.argmin(
-            masked_depths, axis=0, mode=mode, softness=softness,
-        )
-
-        # sj.take_along_axis contract: soft_index has shape
-        # (k, ..., [n]), so the gather axis dim must sit at -1.
-        win_depth = sj.take_along_axis(
-            masked_depths, winner[None], axis=0,
-        )[0]                                                    # (H, W)
-        win_color = sj.take_along_axis(
-            colors, winner[None, ..., None, :], axis=0,
-        )[0]                                                    # (H, W, 3)
-
-        #coverage = jnp.max(insides, axis=0)                       # (H, W)
-        #write = win_depth < depth_buf                              # (H, W)
-        #alpha = coverage * write.astype(coverage.dtype)           # (H, W)
-        #color_buf = sj.where(alpha[..., None], win_color, color_buf)
-        # Depth: a single scalar per pixel has no meaningful soft
-        # blend against +inf, so use a hard threshold on coverage.
-        #depth_write = write & (coverage > 0.5)
-        #depth_buf = jnp.where(depth_write, win_depth, depth_buf)
+    inside_inv_depths = sj.where(insides, (1.0 / depths), _EPS)
+    winner = sj.argmax(inside_inv_depths, axis=0, mode=mode, softness=softness_depth)
+    win_depth = sj.take_along_axis(1.0/inside_inv_depths, winner[None], axis=0)[0]                                                    # (H, W)
+    win_color = sj.take_along_axis(colors, winner[None, ..., None, :], axis=0)[0]                                                    # (H, W, 3)
 
     return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
 
@@ -335,6 +322,12 @@ def _load_obj(path):
     )
 
 
+def _rotation_x(angle):
+    c, s = jnp.cos(angle), jnp.sin(angle)
+    return jnp.array([[1.0, 0.0, 0.0],
+                      [0.0, c, -s],
+                      [0.0, s, c]])
+    
 def _rotation_y(angle):
     c, s = jnp.cos(angle), jnp.sin(angle)
     return jnp.array([[c, 0.0, s],
@@ -344,8 +337,9 @@ def _rotation_y(angle):
 
 def _normal_shader(pixel_xy, tex_coord, normal, depth):
     """Visualise the interpolated world-space normal as RGB in [0, 1]."""
-    return normal * 0.5 + 0.5
-
+    norm = jnp.linalg.norm(normal, axis=-1, keepdims=True)
+    unit = normal / jnp.where(norm < _EPS, 1.0, norm)
+    return unit * 0.5 + 0.5
 
 def main():
     import os
@@ -365,8 +359,8 @@ def main():
         ),
     )
 
-    scale = jnp.asarray(1.5, dtype=jnp.float32)
-
+    vertices2, normals2, tex_coords2 = _load_obj(os.path.join(here, "floor.obj"))
+    
     def make_scene(angle_rad):
         model = Model(
             vertices=vertices,
@@ -375,11 +369,28 @@ def main():
             transform=Transform(
                 position=jnp.zeros(3),
                 rotation=_rotation_y(angle_rad),
-                scale=scale,
+                scale=jnp.asarray(1.5, dtype=jnp.float32),
             ),
             shader=_normal_shader,
         )
-        return SceneData(camera=camera, models=[model])
+        # Floor.obj is a 10x10 plane at y=0 with normal +y. Rotate it
+        # -90 deg around x so it stands up as a wall (normal points at
+        # the camera, -z), then place it behind the cube. At world
+        # z = 3 the view-space distance is 6, so the FOV cone has a
+        # vertical half-extent of 6 * tan(pi/6) ~= 3.46; scale 1.5
+        # gives a 15x15 wall, comfortably covering it.
+        background = Model(
+            vertices=vertices2,
+            tex_coords=tex_coords2,
+            normals=normals2,
+            transform=Transform(
+                position=jnp.array([0.0, 0.0, 3.0]),
+                rotation=_rotation_x(-jnp.pi / 2),
+                scale=jnp.asarray(1.5, dtype=jnp.float32),
+            ),
+            shader=_normal_shader,
+        )
+        return SceneData(camera=camera, models=[background, model])
 
     def empty_target():
         return RenderTarget(
@@ -436,8 +447,6 @@ def main():
         figsize=(2.2 * n_cols, 4.8),
         constrained_layout=True,
     )
-    fig.suptitle(f"Cube rendered at scale ×{float(scale):.2f}", fontsize=14)
-
     def _strip_ticks(ax):
         ax.set_xticks([])
         ax.set_yticks([])
@@ -455,7 +464,6 @@ def main():
     finite_depths = [jnp.where(jnp.isfinite(d), d, jnp.nan) for d in depth_images]
     vmin = float(jnp.nanmin(jnp.stack([jnp.nanmin(d) for d in finite_depths])))
     vmax = float(jnp.nanmax(jnp.stack([jnp.nanmax(d) for d in finite_depths])))
-    print(vmin, vmax)
     for ax, depth in zip(axes[1], finite_depths):
         im = ax.imshow(depth, cmap="gray", vmin=vmin, vmax=vmax)
         _strip_ticks(ax)
