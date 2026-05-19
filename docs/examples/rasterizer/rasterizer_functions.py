@@ -143,9 +143,9 @@ def point_in_triangle(a, b, c, p, mode, softness):
     area_cap = signed_parallelogram_area(c, a, p)
     area_total = area_abp + area_bcp + area_cap
     inv_total = jnp.where(jnp.abs(area_total) < _EPS, 1.0 / _EPS, 1.0 / area_total)
-    weight_a = area_bcp * inv_total
-    weight_b = area_cap * inv_total
-    weight_c = area_abp * inv_total
+    weight_a = sj.clip(area_bcp * inv_total, 0.0, 1.0, mode=mode, softness=softness)
+    weight_b = sj.clip(area_cap * inv_total, 0.0, 1.0, mode=mode, softness=softness)
+    weight_c = sj.clip(area_abp * inv_total, 0.0, 1.0, mode=mode, softness=softness)
     inside = sj.all(jnp.stack([
         sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness),
         sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness),
@@ -240,7 +240,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 
-def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e-1):
+def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=3e-1):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
