@@ -239,8 +239,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 
 # --- Top-level render -----------------------------------------------------
 
-
-def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=3e-1):
+@jax.jit
+def render(target, scene_data, mode="hard", softness_depth=1e-2, softness_inside=1e-2):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -352,7 +352,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -379,12 +379,6 @@ def main():
             ),
             shader=_normal_shader,
         )
-        # Floor.obj is a 10x10 plane at y=0 with normal +y. Rotate it
-        # -90 deg around x so it stands up as a wall (normal points at
-        # the camera, -z), then place it behind the cube. At world
-        # z = 3 the view-space distance is 6, so the FOV cone has a
-        # vertical half-extent of 6 * tan(pi/6) ~= 3.46; scale 1.5
-        # gives a 15x15 wall, comfortably covering it.
         background = Model(
             vertices=vertices2,
             tex_coords=tex_coords2,
