@@ -29,7 +29,7 @@ lj.monkey_patch()
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
-_EPS = 1e-6
+_EPS = 1e-8
 
 
 # --- Data structures (lightweight stand-ins for the C# Types/) ------------
@@ -142,10 +142,9 @@ def point_in_triangle(a, b, c, p, mode, softness):
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
     area_total = area_abp + area_bcp + area_cap
-    inv_total = jnp.where(jnp.abs(area_total) < _EPS, 1.0 / _EPS, 1.0 / area_total)
-    weight_a = sj.clip(area_bcp * inv_total, 0.0, 1.0, mode=mode, softness=softness)
-    weight_b = sj.clip(area_cap * inv_total, 0.0, 1.0, mode=mode, softness=softness)
-    weight_c = sj.clip(area_abp * inv_total, 0.0, 1.0, mode=mode, softness=softness)
+    weight_a = sj.clip(safe_division(area_bcp, area_total), 0.0, 1.0, mode=mode, softness=softness)
+    weight_b = sj.clip(safe_division(area_cap, area_total), 0.0, 1.0, mode=mode, softness=softness)
+    weight_c = sj.clip(safe_division(area_abp, area_total), 0.0, 1.0, mode=mode, softness=softness)
     inside = sj.all(jnp.stack([
         sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness),
         sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness),
@@ -240,7 +239,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 @jax.jit
-def render(target, scene_data, mode="hard", softness_depth=1e-2, softness_inside=1e-2):
+def render(target, scene_data, mode="hard", softness_depth=1e-3, softness_inside=1e-2):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -256,15 +255,23 @@ def render(target, scene_data, mode="hard", softness_depth=1e-2, softness_inside
     h, w = target.color_buffer.shape[:2]
     
     
-    per_model = [process_model(model_i, camera, target) for model_i in scene_data.models]
-    projected_triangles = jax.tree.map(
-        lambda *xs: jnp.concatenate(xs, axis=0), *per_model,
-    )
+    # Rasterise each model separately so every model uses its own
+    # shader, then stack the per-model buffers along the triangle axis.
+    per_model_buffers = []
+    for model_i in scene_data.models:
+        projected_triangles = process_model(model_i, camera, target)
+        per_model_buffers.append(
+            jax.vmap(
+                lambda tri, shader=model_i.shader: rasterize_triangle(
+                    tri, h, w, shader, mode, softness_inside
+                )
+            )(projected_triangles)
+        )
 
     # (n_tris, H, W, 3), (n_tris, H, W), (n_tris, H, W)
-    colors, depths, insides = jax.vmap(
-        lambda tri: rasterize_triangle(tri, h, w, scene_data.models[0].shader, mode, softness_inside)
-    )(projected_triangles)
+    colors, depths, insides = jax.tree.map(
+        lambda *xs: jnp.concatenate(xs, axis=0), *per_model_buffers,
+    )
 
     def normalize(x):
         x_min = jnp.min(x, axis=0, keepdims=True)
@@ -347,12 +354,16 @@ def _normal_shader(pixel_xy, tex_coord, normal, depth):
     unit = normal / jnp.where(norm < _EPS, 1.0, norm)
     return unit * 0.5 + 0.5
 
+def _white_shader(pixel_xy, tex_coord, normal, depth):
+    """Flat white shader — paints every covered pixel RGB (1, 1, 1)."""
+    return jnp.ones((*pixel_xy.shape[:-1], 3), dtype=jnp.float32)
+
 def main():
     import os
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -388,7 +399,7 @@ def main():
                 rotation=_rotation_x(-jnp.pi / 2),
                 scale=jnp.asarray(1.5, dtype=jnp.float32),
             ),
-            shader=_normal_shader,
+            shader=_white_shader,
         )
         return SceneData(camera=camera, models=[background, model])
 
