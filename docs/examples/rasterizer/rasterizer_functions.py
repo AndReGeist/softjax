@@ -30,7 +30,7 @@ lj.monkey_patch()
 
 # Small clamp used in divisions to keep gradients finite on near-degenerate
 # input (zero-area triangles, near-zero view-space z).
-_EPS = 1e-8
+_EPS = 1e-10
 
 
 # --- Data structures (lightweight stand-ins for the C# Types/) ------------
@@ -134,18 +134,18 @@ def signed_parallelogram_area(a, b, c):
 
 
 def point_in_triangle(a, b, c, p, mode, softness):
-    """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
-
-    Coverage is a soft fuzzy-AND of three sigmoidal half-plane tests;
-    ``inside`` is a SoftBool in [0, 1] of the same shape as ``p``.
-    """
+    """Coverage test + barycentric weights. Back-faces (CCW) are excluded."""
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
+    weight_a = sj.clip(area_bcp, 0.0, 1.0, mode="hard")
+    weight_b = sj.clip(area_cap, 0.0, 1.0, mode="hard")
+    weight_c = sj.clip(area_abp, 0.0, 1.0, mode="hard")
     area_total = area_abp + area_bcp + area_cap
-    weight_a = sj.clip(safe_division(area_bcp, area_total), 0.0, 1.0, mode=mode, softness=softness)
-    weight_b = sj.clip(safe_division(area_cap, area_total), 0.0, 1.0, mode=mode, softness=softness)
-    weight_c = sj.clip(safe_division(area_abp, area_total), 0.0, 1.0, mode=mode, softness=softness)
+    weight_a = safe_division(area_bcp, area_total)
+    weight_b = safe_division(area_cap, area_total)
+    weight_c = safe_division(area_abp, area_total)
+    
     inside = sj.all(jnp.stack([
         sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
@@ -204,7 +204,8 @@ def _pixel_grid(height, width):
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
     )
 
-def rasterize_triangle(triangle, h, w, shader, mode, softness):
+def rasterize_triangle(triangle, h, w, shader, mode, softness, 
+                       depth_perspective_scaling=False):
     """Shade one triangle over an ``H x W`` pixel grid.
 
     ``triangle`` is a single ``RasterizedModel`` (leaves of shape
@@ -220,18 +221,23 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
     # Barycentric weights and Bool if pixel is inside triangle.
     p = _pixel_grid(h, w)                                       # (H, W, 2)
     inside, wa, wb, wc = point_in_triangle(a, b, c, p, mode, softness)
+    weights = jnp.stack([wa, wb, wc], axis=-1)   # (H, W, 3)
 
     # Ensure linear interpolation in screen space becomes perspective-correct.
-    inv_depths = safe_division(1.0, triangle.depth)            # (3, 1)
-    weights = jnp.stack([wa, wb, wc], axis=-1)   # (H, W, 3)
-    inv_z_per_pixel = weights @ inv_depths       # (H, W)
-    depth = safe_division(1.0, inv_z_per_pixel)  # (H, W)
+    if depth_perspective_scaling:
+        inv_depths = safe_division(1.0, triangle.depth)
+        inv_z_per_pixel = weights @ inv_depths       # (H, W)
+        depth = safe_division(1.0, inv_z_per_pixel)  # (H, W)
+        
+        tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
+        tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
     
-    tex_over_z = triangle.tex_coords * inv_depths[:, None]     # (3, 2)
-    tex_coord = jnp.einsum("hwk,kc->hwc", weights, tex_over_z) * depth[..., None]
-    
-    nrm_over_z = triangle.normals * inv_depths[:, None]     # (3, 3)
-    normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
+        nrm_over_z = triangle.normals * inv_depths[:, None]     # (3, 3)
+        normal    = jnp.einsum("hwk,kc->hwc", weights, nrm_over_z) * depth[..., None]
+    else:
+        depth = weights @ triangle.depth
+        tex_coord = weights @ triangle.tex_coords
+        normal = weights @ triangle.normals
 
     color = shader(p, tex_coord, normal, depth) # (H, W, 3)
     return color, depth, inside
@@ -240,7 +246,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 # --- Top-level render -----------------------------------------------------
 
 @partial(jax.jit, static_argnames="mode")
-def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e0):
+def render(target, scene_data, mode="smooth", softness_depth=1e-4, softness_inside=1e-4):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -275,20 +281,23 @@ def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_insi
     )
 
     def normalize(x):
-        x_min = jnp.min(x, axis=0, keepdims=True)
-        x_max = jnp.max(x, axis=0, keepdims=True)
-        return (x - x_min) / (x_max - x_min) + _EPS
+        x_near = jnp.min(x, axis=0, keepdims=True)
+        x_far = jnp.max(x, axis=0, keepdims=True)
+        return (x_far - x) / (x_far - x_near)
 
-    inv_depth = 1 / depths
-    inv_depth = normalize(inv_depth)
-    weights = jnp.moveaxis(sj.argmax(inv_depth + jnp.log(insides + _EPS), axis=0, mode=mode, softness=softness_depth), -1, 0)                                           # (n_tris, H, W)
+    normed_depth = normalize(depths)
+    weights = jnp.moveaxis(sj.argmax(normed_depth + jnp.log(insides + _EPS), 
+                                     axis=0, 
+                                     mode=mode, 
+                                     softness=softness_depth,
+                                     standardize=False), -1, 0)                                           # (n_tris, H, W)
     win_depth = jnp.sum(weights * depths, axis=0)            # (H, W)
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
     return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
 
 
-# --- Demo: load cube.obj and render at several rotations ------------------
+# --- Demo: load obj and render at several rotations ------------------
 
 
 def _load_obj(path):
@@ -364,7 +373,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -483,7 +492,8 @@ def main():
 
     fig.colorbar(im, ax=axes[1, :].tolist(), shrink=0.85, label="view-space z")
 
-    plt.savefig("./rendered_cubes.png", dpi=150, bbox_inches="tight")
+    here = os.path.dirname(os.path.abspath(__file__))
+    plt.savefig(os.path.join(here, "rendered_cubes.png"), dpi=150, bbox_inches="tight")
 
 
 if __name__ == "__main__":
