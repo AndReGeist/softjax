@@ -138,13 +138,14 @@ def point_in_triangle(a, b, c, p, mode, softness):
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
+    
     weight_a = sj.clip(area_bcp, 0.0, 1.0, mode="hard")
     weight_b = sj.clip(area_cap, 0.0, 1.0, mode="hard")
     weight_c = sj.clip(area_abp, 0.0, 1.0, mode="hard")
-    area_total = area_abp + area_bcp + area_cap
-    weight_a = safe_division(area_bcp, area_total)
-    weight_b = safe_division(area_cap, area_total)
-    weight_c = safe_division(area_abp, area_total)
+    weight_total = weight_a + weight_b + weight_c
+    weight_a = safe_division(weight_a, weight_total)
+    weight_b = safe_division(weight_b, weight_total)
+    weight_c = safe_division(weight_c, weight_total)
     
     inside = sj.all(jnp.stack([
         sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
