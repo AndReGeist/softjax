@@ -17,6 +17,7 @@ Pipeline (per frame):
 """
 
 from pyexpat import model
+from functools import partial
 from typing import NamedTuple, Sequence
 
 import jax
@@ -146,9 +147,9 @@ def point_in_triangle(a, b, c, p, mode, softness):
     weight_b = sj.clip(safe_division(area_cap, area_total), 0.0, 1.0, mode=mode, softness=softness)
     weight_c = sj.clip(safe_division(area_abp, area_total), 0.0, 1.0, mode=mode, softness=softness)
     inside = sj.all(jnp.stack([
-        sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness),
-        sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness),
-        sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness),
+        sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
     ], axis=-1), axis=-1)
     return inside, weight_a, weight_b, weight_c
 
@@ -238,8 +239,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness):
 
 # --- Top-level render -----------------------------------------------------
 
-@jax.jit
-def render(target, scene_data, mode="hard", softness_depth=1e-3, softness_inside=1e-2):
+@partial(jax.jit, static_argnames="mode")
+def render(target, scene_data, mode="smooth", softness_depth=1e-1, softness_inside=1e0):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
