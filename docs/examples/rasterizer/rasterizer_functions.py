@@ -132,31 +132,50 @@ def signed_parallelogram_area(a, b, c):
     return (c[..., 0] - a[..., 0]) * (b[..., 1] - a[..., 1]) \
          + (c[..., 1] - a[..., 1]) * (a[..., 0] - b[..., 0])
 
-
-def point_in_triangle(a, b, c, p, mode, softness):
-    """Coverage test + barycentric weights. Back-faces (CCW) are excluded."""
+def signed_squared_dist(a, b, c, w1, w2, w3, area_abp, area_bcp, area_cap, p):
+    """SoftRas Eq. 3-4 signed squared distance from p to triangle (a, b, c)."""
+    closest = w1[..., None] * a + w2[..., None] * b + w3[..., None] * c
+    dist_sq = jnp.sum((closest - p) ** 2, axis=-1)
+    inside = (area_abp >= 0.0) & (area_bcp >= 0.0) & (area_cap >= 0.0)
+    sign = jnp.where(inside, 1.0, -1.0)
+    return sign * dist_sq
+    
+def point_in_triangle(a, b, c, p, mode, softness, inside_method="area"):
+    """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
+    Note: p contains all pixel positions having shape (H, W, 2)
+    """
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
     
-    weight_a = sj.clip(area_bcp, 0.0, 1.0, mode="hard")
-    weight_b = sj.clip(area_cap, 0.0, 1.0, mode="hard")
-    weight_c = sj.clip(area_abp, 0.0, 1.0, mode="hard")
+    weight_a = jnp.clip(area_bcp, 0.0, 1.0)
+    weight_b = jnp.clip(area_cap, 0.0, 1.0)
+    weight_c = jnp.clip(area_abp, 0.0, 1.0)
     weight_total = weight_a + weight_b + weight_c
     weight_a = safe_division(weight_a, weight_total)
     weight_b = safe_division(weight_b, weight_total)
     weight_c = safe_division(weight_c, weight_total)
     
-    inside = sj.all(jnp.stack([
-        sj.greater_equal(jnp.sign(area_abp) * area_abp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-        sj.greater_equal(jnp.sign(area_bcp) * area_bcp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-        sj.greater_equal(jnp.sign(area_cap) * area_cap**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    ], axis=-1), axis=-1,
-    use_geometric_mean=False)
-    # min_area= sj.min(jnp.stack([area_abp, area_bcp, area_cap], axis=-1), 
-    #                  axis=-1, mode=mode, softness=softness)
-    # area_sign = jnp.sign(min_area)
-    # inside = sj.greater_equal(area_sign * min_area**2, 0.0, mode=mode, softness=softness, epsilon=_EPS)
+    if inside_method == "distance":
+        dist_sq = signed_squared_dist(a, b, c, 
+                                      weight_a, weight_b, weight_c,
+                                      area_abp, area_bcp, area_cap,
+                                      p)
+        inside = sj.greater_equal(dist_sq, 0.0, mode=mode, softness=softness, epsilon=_EPS)
+    elif inside_method == "area":
+        inside = sj.all(jnp.stack([
+            sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        ], axis=-1), axis=-1,
+        use_geometric_mean=False)
+    elif inside_method == "area_squared":
+        inside = sj.all(jnp.stack([
+            sj.greater_equal(jnp.sign(area_abp) * area_abp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(jnp.sign(area_bcp) * area_bcp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(jnp.sign(area_cap) * area_cap**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        ], axis=-1), axis=-1,
+        use_geometric_mean=True)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -208,7 +227,12 @@ def _pixel_grid(height, width):
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
     )
 
-def rasterize_triangle(triangle, h, w, shader, mode, softness,
+def rasterize_triangle(triangle, 
+                       h, 
+                       w, 
+                       shader, 
+                       mode, 
+                       softness,
                        depth_perspective_scaling=False):
     """Shade one triangle over an ``H x W`` pixel grid.
 
@@ -223,7 +247,7 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness,
     c = triangle.screen_pos[2]
 
     # Barycentric weights and Bool if pixel is inside triangle.
-    p = _pixel_grid(h, w)                                       # (H, W, 2)
+    p = _pixel_grid(h, w)  # (H, W, 2)
     inside, wa, wb, wc = point_in_triangle(a, b, c, p, mode, softness)
     weights = jnp.stack([wa, wb, wc], axis=-1)   # (H, W, 3)
 
@@ -254,9 +278,9 @@ def render(target,
            scene_data, 
            mode="smooth", 
            softness_depth=1e0, 
-           softness_inside=1e4,
-           background_color=0.0,
-           background_depth_epsilon=1e-8):
+           softness_inside=1e-1,
+           background_color=1.0,
+           background_depth_epsilon=1e-6):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -386,7 +410,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
