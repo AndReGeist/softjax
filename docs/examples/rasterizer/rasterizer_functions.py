@@ -147,16 +147,16 @@ def point_in_triangle(a, b, c, p, mode, softness):
     weight_b = safe_division(weight_b, weight_total)
     weight_c = safe_division(weight_c, weight_total)
     
-    # inside = sj.all(jnp.stack([
-    #     sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    #     sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    #     sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    # ], axis=-1), axis=-1,
-    # use_geometric_mean=True)
-    min_area= sj.min(jnp.stack([area_abp, area_bcp, area_cap], axis=-1), 
-                     axis=-1, mode=mode, softness=softness)
-    area_sign = jnp.sign(min_area)
-    inside = sj.greater_equal(area_sign * min_area**2, 0.0, mode=mode, softness=softness, epsilon=_EPS)
+    inside = sj.all(jnp.stack([
+        sj.greater_equal(jnp.sign(area_abp) * area_abp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        sj.greater_equal(jnp.sign(area_bcp) * area_bcp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+        sj.greater_equal(jnp.sign(area_cap) * area_cap**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+    ], axis=-1), axis=-1,
+    use_geometric_mean=False)
+    # min_area= sj.min(jnp.stack([area_abp, area_bcp, area_cap], axis=-1), 
+    #                  axis=-1, mode=mode, softness=softness)
+    # area_sign = jnp.sign(min_area)
+    # inside = sj.greater_equal(area_sign * min_area**2, 0.0, mode=mode, softness=softness, epsilon=_EPS)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -253,8 +253,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e-2, 
-           softness_inside=0.2e0,
+           softness_depth=1e0, 
+           softness_inside=1e4,
            background_color=0.0,
            background_depth_epsilon=1e-8):
     """Composite every model in ``scene_data`` into ``target``.
@@ -386,7 +386,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
