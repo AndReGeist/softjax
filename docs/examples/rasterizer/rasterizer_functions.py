@@ -147,18 +147,20 @@ def point_in_triangle(a, b, c, p, mode, softness):
     weight_b = safe_division(weight_b, weight_total)
     weight_c = safe_division(weight_c, weight_total)
     
-    inside = sj.all(jnp.stack([
-        sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-        sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-        sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    ], axis=-1), axis=-1,
-    use_geometric_mean=True)
+    # inside = sj.all(jnp.stack([
+    #     sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+    #     sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+    #     sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+    # ], axis=-1), axis=-1,
+    # use_geometric_mean=True)
+    min_area= sj.min(jnp.stack([area_abp, area_bcp, area_cap], axis=-1), 
+                     axis=-1, mode=mode, softness=softness)
+    area_sign = jnp.sign(min_area)
+    inside = sj.greater_equal(area_sign * min_area**2, 0.0, mode=mode, softness=softness, epsilon=_EPS)
     return inside, weight_a, weight_b, weight_c
 
 
 # --- Vertex transform & projection ----------------------------------------
-
-
 def vertex_to_view(vert, model_transform, camera):
     world = model_transform.to_world_point(vert)
     return camera.transform.to_local_point(world)
@@ -251,8 +253,8 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e-1, 
-           softness_inside=1e3,
+           softness_depth=1e-2, 
+           softness_inside=0.2e0,
            background_color=0.0,
            background_depth_epsilon=1e-8):
     """Composite every model in ``scene_data`` into ``target``.
