@@ -151,7 +151,8 @@ def point_in_triangle(a, b, c, p, mode, softness):
         sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-    ], axis=-1), axis=-1)
+    ], axis=-1), axis=-1,
+    use_geometric_mean=True)
     return inside, weight_a, weight_b, weight_c
 
 
@@ -205,7 +206,7 @@ def _pixel_grid(height, width):
         [xs.astype(jnp.float32), ys.astype(jnp.float32)], axis=-1,
     )
 
-def rasterize_triangle(triangle, h, w, shader, mode, softness, 
+def rasterize_triangle(triangle, h, w, shader, mode, softness,
                        depth_perspective_scaling=False):
     """Shade one triangle over an ``H x W`` pixel grid.
 
@@ -247,7 +248,13 @@ def rasterize_triangle(triangle, h, w, shader, mode, softness,
 # --- Top-level render -----------------------------------------------------
 
 @partial(jax.jit, static_argnames="mode")
-def render(target, scene_data, mode="smooth", softness_depth=1e-4, softness_inside=1e-4):
+def render(target, 
+           scene_data, 
+           mode="smooth", 
+           softness_depth=1e-1, 
+           softness_inside=1e3,
+           background_color=0.0,
+           background_depth_epsilon=1e-8):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -280,19 +287,22 @@ def render(target, scene_data, mode="smooth", softness_depth=1e-4, softness_insi
     colors, depths, insides = jax.tree.map(
         lambda *xs: jnp.concatenate(xs, axis=0), *per_model_buffers,
     )
-
+    
     def normalize(x):
-        x_near = jnp.min(x, axis=0, keepdims=True)
-        x_far = jnp.max(x, axis=0, keepdims=True)
+        x_near = jnp.min(x, keepdims=True)
+        x_far = jnp.max(x, keepdims=True)
         return (x_far - x) / (x_far - x_near)
 
-    normed_depth = normalize(depths)
+    normed_depth = jnp.r_[normalize(depths), jnp.full((1, h, w), background_depth_epsilon)]
+    insides = jnp.r_[insides, jnp.ones((1, h, w))]
     weights = jnp.moveaxis(sj.argmax(normed_depth + jnp.log(insides + _EPS), 
                                      axis=0, 
                                      mode=mode, 
                                      softness=softness_depth,
-                                     standardize=False), -1, 0)                                           # (n_tris, H, W)
-    win_depth = jnp.sum(weights * depths, axis=0)            # (H, W)
+                                     standardize=False), -1, 0)   
+    depths = jnp.r_[depths, jnp.zeros((1, h, w))]
+    win_depth = jnp.sum(weights * depths, axis=0)
+    colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
     return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
@@ -374,7 +384,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -401,18 +411,18 @@ def main():
             ),
             shader=_normal_shader,
         )
-        background = Model(
-            vertices=vertices2,
-            tex_coords=tex_coords2,
-            normals=normals2,
-            transform=Transform(
-                position=jnp.array([0.0, 0.0, 3.0]),
-                rotation=_rotation_x(-jnp.pi / 2),
-                scale=jnp.asarray(1.5, dtype=jnp.float32),
-            ),
-            shader=_white_shader,
-        )
-        return SceneData(camera=camera, models=[background, model])
+        # background = Model(
+        #     vertices=vertices2,
+        #     tex_coords=tex_coords2,
+        #     normals=normals2,
+        #     transform=Transform(
+        #         position=jnp.array([0.0, 0.0, 3.0]),
+        #         rotation=_rotation_x(-jnp.pi / 2),
+        #         scale=jnp.asarray(1.5, dtype=jnp.float32),
+        #     ),
+        #     shader=_white_shader,
+        # )
+        return SceneData(camera=camera, models=[model])
 
     def empty_target():
         return RenderTarget(
