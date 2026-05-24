@@ -311,8 +311,8 @@ def rasterize_triangle(triangle,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e-4, 
-           softness_inside=1e-4,
+           softness_depth=1e-0, 
+           softness_inside=1e-1,
            background_color=0.0,
            background_depth_epsilon=_EPS):
     """Composite every model in ``scene_data`` into ``target``.
@@ -354,15 +354,15 @@ def render(target,
         return (x_max - x) / (x_max - x_min)
 
     normed_depth = normalize(depths)
-    # normed_depth = jnp.r_[normed_depth, jnp.full((1, h, w), jnp.min(normed_depth))]
-    # depths = jnp.r_[depths, jnp.full((1, h, w), jnp.max(depths))]
-    # colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
-    # insides = jnp.r_[insides, jnp.ones((1, h, w))]
+    normed_depth = jnp.r_[normed_depth, jnp.full((1, h, w), background_depth_epsilon)]
+    depths = jnp.r_[depths, jnp.full((1, h, w), jnp.max(depths))]
+    colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
+    insides = jnp.r_[insides, jnp.ones((1, h, w))]
     
-    weights = jnp.moveaxis(sj.argmax(normed_depth + jnp.log(insides), 
+    weights = jnp.moveaxis(sj.argmax(normed_depth / softness_depth + jnp.log(insides), 
                                      axis=0, 
                                      mode=mode, 
-                                     softness=softness_depth,
+                                     softness=1.0,
                                      standardize=False), -1, 0)
 
     win_depth = jnp.sum(weights * depths, axis=0)
