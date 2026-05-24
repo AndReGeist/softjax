@@ -132,48 +132,72 @@ def signed_parallelogram_area(a, b, c):
     return (c[..., 0] - a[..., 0]) * (b[..., 1] - a[..., 1]) \
          + (c[..., 1] - a[..., 1]) * (a[..., 0] - b[..., 0])
 
-def signed_squared_dist(a, b, c, w1, w2, w3, area_abp, area_bcp, area_cap, p):
-    """SoftRas Eq. 3-4 signed squared distance from p to triangle (a, b, c)."""
+# def perpendicular(v):
+#     """Perpendicular vector in 2D: (x, y) → (-y, x)."""
+#     return jnp.stack([v[..., 1], -v[..., 0]], axis=-1)
+
+# def signed_parallelogram_area(a, b, c):
+#     """signed area of triangle abc (positive for clockwise winding)."""
+#     ac = c[..., :2] - a[..., :2]
+#     abPerp = perpendicular(b[..., :2] - a[..., :2])
+#     return jnp.dot(ac, abPerp) / 2.0
+         
+def signed_squared_dist(a, b, c, w1, w2, w3, p):
     closest = w1[..., None] * a + w2[..., None] * b + w3[..., None] * c
     dist_sq = jnp.sum((closest - p) ** 2, axis=-1)
-    inside = (area_abp >= 0.0) & (area_bcp >= 0.0) & (area_cap >= 0.0)
-    sign = jnp.where(inside, 1.0, -1.0)
-    return sign * dist_sq
+    return dist_sq
+
+def barycentric_coordinates(a, b, c, p):
+    """Compute barycentric coordinates of point (x, y)
+    with respect to triangle: (x1, y1), (x2, y2), (x3, y3).
+    Returns Barycentric coordinates [b1, b2, b3]."""
+    x = p[..., 0]
+    y = p[..., 1]
+    x1 = a[..., 0]
+    y1 = a[..., 1]
+    x2 = b[..., 0]
+    y2 = b[..., 1]
+    x3 = c[..., 0]
+    y3 = c[..., 1]
+    D = (x1 * (y2 - y3) + x2 * (y3 - y1)+ x3 * (y1 - y2))
+
+    b1 = safe_division((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3), D)
+    b2 = safe_division((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3), D)
+    b3 = 1.0 - b1 - b2
+    return b1, b2, b3
     
-def point_in_triangle(a, b, c, p, mode, softness, inside_method="area"):
+# def barycentric_matrix()
+#     return np.array([[x1, x2, x3], [y1, y2, y3], [1.0, 1.0, 1.0]], dtype=float)
+
+def point_in_triangle(a, b, c, p, mode, softness, inside_method="distance"):
     """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
     Note: p contains all pixel positions having shape (H, W, 2)
     """
-    area_abp = signed_parallelogram_area(a, b, p)
-    area_bcp = signed_parallelogram_area(b, c, p)
-    area_cap = signed_parallelogram_area(c, a, p)
-    area_total = area_abp + area_bcp + area_cap
-    weight_a = jnp.clip(area_bcp / area_total, 0.0, 1.0)
-    weight_b = jnp.clip(area_cap / area_total, 0.0, 1.0)
-    weight_c = jnp.clip(area_abp / area_total, 0.0, 1.0)
+    b1, b2, b3 = barycentric_coordinates(a, b, c, p)
+    weight_a = jnp.clip(b1, 0.0, 1.0)
+    weight_b = jnp.clip(b2, 0.0, 1.0)
+    weight_c = jnp.clip(b3, 0.0, 1.0)
     weight_total = weight_a + weight_b + weight_c
     weight_a = safe_division(weight_a, weight_total)
     weight_b = safe_division(weight_b, weight_total)
     weight_c = safe_division(weight_c, weight_total)
     
     if inside_method == "distance":
-        signed_dist_sq = signed_squared_dist(a, b, c, 
-                                      weight_a, weight_b, weight_c,
-                                      area_abp, area_bcp, area_cap,
-                                      p)
-        inside = sj.greater_equal(signed_dist_sq, 0.0, mode=mode, softness=softness, epsilon=_EPS)
+        dist_sq = signed_squared_dist(a, b, c, b1, p)
+        sign = jnp.where((b1 >= 0.0) & (b2 >= 0.0) & (b3 >= 0.0), 1.0, -1.0)
+        inside = sj.greater_equal(sign * dist_sq, 0.0, mode=mode, softness=softness, epsilon=_EPS)
     elif inside_method == "area":
         inside = sj.all(jnp.stack([
-            sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-            sj.greater_equal(area_bcp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-            sj.greater_equal(area_cap, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(b1, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(b2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(b3, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         ], axis=-1), axis=-1,
         use_geometric_mean=False)
     elif inside_method == "area_squared":
         inside = sj.all(jnp.stack([
-            sj.greater_equal(jnp.sign(area_abp) * area_abp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-            sj.greater_equal(jnp.sign(area_bcp) * area_bcp**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
-            sj.greater_equal(jnp.sign(area_cap) * area_cap**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(jnp.sign(b1) * b1**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(jnp.sign(b2) * b2**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
+            sj.greater_equal(jnp.sign(b3) * b3**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         ], axis=-1), axis=-1,
         use_geometric_mean=True)
     return inside, weight_a, weight_b, weight_c
