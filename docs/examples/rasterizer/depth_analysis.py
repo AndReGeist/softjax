@@ -47,14 +47,19 @@ def _dummy_shader(pixel_xy, tex_coord, normal, depth):
 
 def main():
     H, W = 256, 256
-
-    # Triangle that fits well inside the image, big enough that the
-    # signed-area clip in `point_in_triangle` saturates (centroid collapse).
-    # Screen-space pixel coordinates: (x, y), origin top-left.
+    
+    # CW winding order
+    # screen_pos = 0.5 * jnp.array([
+    #     [ 50.0,  60.0],   # a
+    #     [200.0,  80.0],   # b
+    #     [120.0, 210.0],   # c
+    # ])
+    
+    # CCW winding order
     screen_pos = 0.5 * jnp.array([
-        [ 50.0,  60.0],   # a
-        [200.0,  80.0],   # b
         [120.0, 210.0],   # c
+        [200.0,  80.0],   # b
+        [ 50.0,  60.0],   # a
     ])
     # Make vertex depths *clearly different* so the interpolation pattern
     # is visible. A correct rasterizer should show a smooth gradient
@@ -63,7 +68,7 @@ def main():
 
     triangle = make_single_triangle(screen_pos, vertex_depths)
 
-    softness = 1e0
+    softness = 1e-3
     color_h, depth_h, inside_h = rf.rasterize_triangle(
         triangle, H, W, _dummy_shader, mode="hard", softness=softness,
     )

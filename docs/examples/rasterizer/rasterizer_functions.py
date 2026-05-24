@@ -168,15 +168,15 @@ def barycentric_coordinates(a, b, c, p):
     l1 = jnp.sqrt((x2 - x3) ** 2 + (y2 - y3) ** 2)
     l2 = jnp.sqrt((x3 - x1) ** 2 + (y3 - y1) ** 2)
     l3 = jnp.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-    d1 = b1 / l1
-    d2 = b2 / l2
-    d3 = b3 / l3
+    d1 = jnp.abs(D) * b1 / l1
+    d2 = jnp.abs(D) * b2 / l2
+    d3 = jnp.abs(D) * b3 / l3
     return b1, b2, b3, d1, d2, d3
     
 # def barycentric_matrix()
 #     return np.array([[x1, x2, x3], [y1, y2, y3], [1.0, 1.0, 1.0]], dtype=float)
 
-def point_in_triangle(a, b, c, p, mode, softness, inside_method="distance"):
+def point_in_triangle(a, b, c, p, mode, softness, inside_method="area"):
     """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
     Note: p contains all pixel positions having shape (H, W, 2)
     """
@@ -311,8 +311,8 @@ def rasterize_triangle(triangle,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e-0, 
-           softness_inside=1e-1,
+           softness_depth=1e0, 
+           softness_inside=1.0e-1,
            background_color=0.0,
            background_depth_epsilon=_EPS):
     """Composite every model in ``scene_data`` into ``target``.
@@ -359,7 +359,7 @@ def render(target,
     colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
     insides = jnp.r_[insides, jnp.ones((1, h, w))]
     
-    weights = jnp.moveaxis(sj.argmax(normed_depth / softness_depth + jnp.log(insides), 
+    weights = jnp.moveaxis(sj.argmax(normed_depth / softness_depth + jnp.log(insides + _EPS), 
                                      axis=0, 
                                      mode=mode, 
                                      softness=1.0,
@@ -378,7 +378,6 @@ def _load_obj(path):
     """Minimal OBJ loader. Triangulates polygons via fan and returns
     (vertices, normals, tex_coords) as ``(n_tris, 3, ...)`` arrays."""
 
-    # TODO: Add check for OBJ convention is CCW front-facing.
     print(f"Loading OBJ file from {path}...")
     print("Warning: this is a minimal loader for demo purposes assuming OBJ convention is CCW front-facing.")
     positions, normals, tex_coords = [], [], []
@@ -412,11 +411,31 @@ def _load_obj(path):
     nrm = jnp.asarray(out_nrm, dtype=jnp.float32)
     tex = jnp.asarray(out_tex, dtype=jnp.float32)
     n_tris = pos.shape[0] // 3
-    return (
-        pos.reshape(n_tris, 3, 3),
-        nrm.reshape(n_tris, 3, 3),
-        tex.reshape(n_tris, 3, 2),
-    )
+    pos = pos.reshape(n_tris, 3, 3)
+    nrm = nrm.reshape(n_tris, 3, 3)
+    tex = tex.reshape(n_tris, 3, 2)
+
+    # CCW front-facing winding check: the geometric face normal
+    # cross(v1 - v0, v2 - v0) should align with the stored outward
+    # vertex normals. Triangles where it points opposite are CW —
+    # swap vertices 1 and 2 (and their attributes) to flip the winding.
+    v0, v1, v2 = pos[:, 0], pos[:, 1], pos[:, 2]
+    face_normal = jnp.cross(v1 - v0, v2 - v0)
+    avg_vertex_normal = jnp.mean(nrm, axis=1)
+    alignment = jnp.sum(face_normal * avg_vertex_normal, axis=-1)
+    needs_flip = alignment < 0.0
+    n_flipped = int(jnp.sum(needs_flip))
+    if n_flipped:
+        print(f"  _load_obj: flipped {n_flipped}/{n_tris} CW triangles to CCW.")
+    swap_idx = jnp.where(needs_flip[:, None],
+                         jnp.array([0, 2, 1]),
+                         jnp.array([0, 1, 2]))
+    tri_idx = jnp.arange(n_tris)[:, None]
+    pos = pos[tri_idx, swap_idx]
+    nrm = nrm[tri_idx, swap_idx]
+    tex = tex[tri_idx, swap_idx]
+
+    return pos, nrm, tex
 
 
 def _rotation_x(angle):
