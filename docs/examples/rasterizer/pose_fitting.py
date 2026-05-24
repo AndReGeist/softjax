@@ -2,18 +2,20 @@
 
 A "start test" for whether the gradients of ``rasterizer_functions.render``
 are usable for gradient-based optimization. We render a sphere at an unknown
-rotation with *hard* rasterization (the target image), then fit a rotation
-matrix so that the *smooth* (differentiable) render of the same sphere
-matches the target under a Euclidean (L2) image loss.
+rotation and translation with *hard* rasterization (the target image), then
+fit both the rotation and the translation so that the *smooth*
+(differentiable) render of the same sphere matches the target under a
+Euclidean (L2) image loss.
 
-Rotation parameterization
--------------------------
-The optimization variable is a free 3x3 matrix ``M`` (9 unconstrained
-numbers). Before use it is projected onto SO(3) via SVD-based symmetric
-orthogonalization (Levinson et al. 2020, "An Analysis of SVD for Deep
-Rotation Estimation"). Gradients flow through the SVD, so plain
-``jax.value_and_grad`` over ``M`` is all that is needed -- ``M`` is a single
-``jax.Array`` with no static leaves, so ``eqx.filter_grad`` buys nothing.
+Pose parameterization
+---------------------
+The optimization variable is a tuple ``(M, t)``: ``M`` is a free 3x3 matrix
+projected onto SO(3) via SVD-based symmetric orthogonalization (Levinson et
+al. 2020, "An Analysis of SVD for Deep Rotation Estimation"), and ``t`` is
+a free 3-vector used directly as the object translation. Gradients flow
+through the SVD, so plain ``jax.value_and_grad`` over ``(M, t)`` is all
+that is needed; both leaves are ``jax.Array`` so ``eqx.filter_grad`` buys
+nothing.
 
 Training loop follows the equinox MNIST example: a jitted ``make_step`` that
 computes ``value_and_grad``, then ``optax`` adam ``update`` / ``apply_updates``.
@@ -21,7 +23,8 @@ computes ``value_and_grad``, then ``optax`` adam ``update`` / ``apply_updates``.
 Output
 ------
 Writes ``pose_fitting.png``: the L2 loss curve, the geodesic rotation-error
-curve, and a target / initial / estimated render comparison.
+curve, the translation-error curve, and a target / initial / estimated
+render comparison.
 """
 
 import os
@@ -71,9 +74,11 @@ def main():
 
     # Optimization at a modest resolution keeps ~400 jitted iterations fast.
     H, W = 128, 128
-    angle_true_deg = 180   # unknown rotation we try to recover
+    angle_true_deg = 90  # unknown rotation we try to recover
+    position_true = jnp.array([0.3, 0.2, 0.0])  # unknown translation we try to recover
     learning_rate = 1e-2
     n_steps = 400
+    params = (jnp.diag(jnp.array([1.3, 1.1, 0.9])), jnp.zeros(3))  # Init values
 
     # --- Geometry ---------------------------------------------------------
     # The sphere's loss landscape descends monotonically from 0 deg to the
@@ -88,7 +93,7 @@ def main():
         transform=rf.Transform(
             position=jnp.array([0.0, 0.0, -3.0]),
             rotation=jnp.eye(3),
-            scale=0.7,
+            scale=1.0,
         ),
     )
 
@@ -98,99 +103,118 @@ def main():
             depth_buffer=jnp.full((H, W), jnp.inf),
         )
 
-    def make_scene(rotation):
-        """Scene with the sphere at ``rotation`` over a flat white background."""
+    def make_scene(rotation, position):
+        """Scene with the sphere at ``rotation``/``position`` over a flat white background."""
         sphere = rf.Model(
             vertices=sphere_v,
             tex_coords=sphere_t,
             normals=sphere_n,
             transform=rf.Transform(
-                position=jnp.zeros(3),
+                position=position,
                 rotation=rotation,
-                scale=jnp.asarray(1.5, dtype=jnp.float32),
+                scale=jnp.asarray(0.5, dtype=jnp.float32),
             ),
             shader=rf._normal_shader,
         )
         return rf.SceneData(camera=camera, models=[sphere])
 
-    def render_color(rotation, mode):
-        return rf.render(empty_target(), make_scene(rotation),
+    def render_color(rotation, position, mode):
+        return rf.render(empty_target(), make_scene(rotation, position),
                          mode=mode).color_buffer
 
-    # --- Target: sphere at an unknown rotation, hard rasterization --------
+    # --- Target: sphere at an unknown pose, hard rasterization ------------
     R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg))
-    target_image = render_color(R_true, mode="hard")
+    target_image = render_color(R_true, position_true, mode="hard")
 
     # --- Loss: L2 between smooth render and the hard target ---------------
-    def loss_fn(M):
-        pred = render_color(svd(M), "smooth")
+    # ``params`` is a (M, t) tuple: M is a free 3x3 projected to SO(3),
+    # t is a free 3-vector used directly as the object translation.
+    def loss_fn(params):
+        M, t = params
+        pred = render_color(svd(M), t, "smooth")
         return jnp.mean((pred - target_image) ** 2)
 
     # --- Optimizer (equinox-style jitted step) ----------------------------
     optimizer = optax.adam(learning_rate)
-    M = jnp.diag(jnp.array([1.3, 1.1, 0.9]))  # Init values
-    opt_state = optimizer.init(M)
+    opt_state = optimizer.init(params)
 
     @jax.jit
-    def make_step(M, opt_state):
-        loss, grads = jax.value_and_grad(loss_fn)(M)
-        updates, opt_state = optimizer.update(grads, opt_state, M)
-        M = optax.apply_updates(M, updates)
-        return M, opt_state, loss
+    def make_step(params, opt_state):
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
 
     # --- Training loop ----------------------------------------------------
-    losses, rot_errors = [], []
-    print(f"Fitting rotation: target = {angle_true_deg:.1f} deg about Y, "
-          f"init = 0 deg, lr = {learning_rate}, steps = {n_steps}")
+    losses, rot_errors, pos_errors = [], [], []
+    print(f"Fitting pose: target rotation = {angle_true_deg:.1f} deg about Y, "
+          f"target position = {tuple(float(v) for v in position_true)}, "
+          f"init = (I, 0), lr = {learning_rate}, steps = {n_steps}")
     for step in range(n_steps):
         print(f"Step {step:4d}/{n_steps}...", end="")
-        M, opt_state, loss = make_step(M, opt_state)
+        params, opt_state, loss = make_step(params, opt_state)
+        M, t = params
         err_deg = float(jnp.rad2deg(geodesic_angle(svd(M), R_true)))
+        pos_err = float(jnp.linalg.norm(t - position_true))
         losses.append(float(loss))
         rot_errors.append(err_deg)
+        pos_errors.append(pos_err)
         if step % 20 == 0 or step == n_steps - 1:
             print(f"  step {step:4d}   loss {float(loss):.6e}   "
-                  f"rot_err {err_deg:7.3f} deg")
+                  f"rot_err {err_deg:7.3f} deg   pos_err {pos_err:.4f}")
 
-    R_est = svd(M)
+    M_est, t_est = params
+    R_est = svd(M_est)
     est_deg = float(jnp.rad2deg(y_angle(R_est)))
     print(f"Done. estimated Y-angle = {est_deg:.2f} deg "
           f"(target {angle_true_deg:.1f} deg), "
-          f"final rotation error = {rot_errors[-1]:.3f} deg")
+          f"estimated position = {tuple(float(v) for v in t_est)} "
+          f"(target {tuple(float(v) for v in position_true)}), "
+          f"final rotation error = {rot_errors[-1]:.3f} deg, "
+          f"final position error = {pos_errors[-1]:.4f}")
 
     # --- Plots ------------------------------------------------------------
-    init_image = render_color(jnp.eye(3), mode="hard")
-    est_image = render_color(R_est, mode="hard")
+    init_image = render_color(jnp.eye(3), jnp.zeros(3), mode="hard")
+    est_image = render_color(R_est, t_est, mode="hard")
 
     fig = plt.figure(figsize=(12, 8), constrained_layout=True)
     fig.suptitle("Rigid pose fitting via the differentiable rasterizer")
     gs = fig.add_gridspec(2, 3)
 
     panels = [
-        (f"target ({angle_true_deg:.0f} deg, hard)", target_image),
-        ("initial (0 deg, hard)", init_image),
-        (f"estimated ({est_deg:.1f} deg, hard)", est_image),
+        (f"target (R={angle_true_deg:.0f} deg, t={tuple(float(v) for v in position_true)}, hard)",
+         target_image),
+        ("initial (R=I, t=0, hard)", init_image),
+        (f"estimated (R={est_deg:.1f} deg, t={tuple(round(float(v), 2) for v in t_est)}, hard)",
+         est_image),
     ]
     for col, (title, img) in enumerate(panels):
         ax = fig.add_subplot(gs[0, col])
         ax.imshow(jnp.clip(img, 0.0, 1.0))
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title, fontsize=9)
         ax.set_xticks([])
         ax.set_yticks([])
 
-    ax_loss = fig.add_subplot(gs[1, :2])
+    ax_loss = fig.add_subplot(gs[1, 0])
     ax_loss.semilogy(losses, color="C0")
     ax_loss.set_xlabel("iteration")
     ax_loss.set_ylabel("L2 image loss")
     ax_loss.set_title("Euclidean image loss", fontsize=10)
     ax_loss.grid(True, alpha=0.3)
 
-    ax_err = fig.add_subplot(gs[1, 2])
-    ax_err.plot(rot_errors, color="C1")
-    ax_err.set_xlabel("iteration")
-    ax_err.set_ylabel("geodesic error (deg)")
-    ax_err.set_title("rotation error", fontsize=10)
-    ax_err.grid(True, alpha=0.3)
+    ax_rot = fig.add_subplot(gs[1, 1])
+    ax_rot.plot(rot_errors, color="C1")
+    ax_rot.set_xlabel("iteration")
+    ax_rot.set_ylabel("geodesic error (deg)")
+    ax_rot.set_title("rotation error", fontsize=10)
+    ax_rot.grid(True, alpha=0.3)
+
+    ax_pos = fig.add_subplot(gs[1, 2])
+    ax_pos.plot(pos_errors, color="C2")
+    ax_pos.set_xlabel("iteration")
+    ax_pos.set_ylabel("||t - t_true||")
+    ax_pos.set_title("position error", fontsize=10)
+    ax_pos.grid(True, alpha=0.3)
 
     out_path = os.path.join(here, "pose_fitting.png")
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
