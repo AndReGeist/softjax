@@ -71,7 +71,7 @@ def main():
 
     # Optimization at a modest resolution keeps ~400 jitted iterations fast.
     H, W = 128, 128
-    angle_true_deg = 50.0   # unknown rotation we try to recover
+    angle_true_deg = 180   # unknown rotation we try to recover
     learning_rate = 1e-2
     n_steps = 400
 
@@ -82,14 +82,13 @@ def main():
     # faceted object such as the cube has a depth-ordering loss ridge near
     # ~15 deg that traps the 0-deg init; a sphere has no such ridge.)
     sphere_v, sphere_n, sphere_t = rf._load_obj(os.path.join(here, "sphere.obj"))
-    sphere_v = sphere_v - 0.5  # centre on the origin so rotation spins in place
-    floor_v, floor_n, floor_t = rf._load_obj(os.path.join(here, "floor.obj"))
 
     camera = rf.Camera(
         fov=jnp.asarray(jnp.pi / 3),
         transform=rf.Transform(
             position=jnp.array([0.0, 0.0, -3.0]),
             rotation=jnp.eye(3),
+            scale=0.7,
         ),
     )
 

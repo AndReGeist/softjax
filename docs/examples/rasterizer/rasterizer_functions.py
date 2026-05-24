@@ -466,9 +466,9 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere2.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
-    vertices = vertices - 0.5
+    #vertices = vertices - 0.5
 
     H, W = 256, 256
     camera = Camera(
