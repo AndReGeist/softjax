@@ -176,7 +176,7 @@ def barycentric_coordinates(a, b, c, p):
 # def barycentric_matrix()
 #     return np.array([[x1, x2, x3], [y1, y2, y3], [1.0, 1.0, 1.0]], dtype=float)
 
-def point_in_triangle(a, b, c, p, mode, softness, inside_method="distance_squared"):
+def point_in_triangle(a, b, c, p, mode, softness, inside_method="distance"):
     """Coverage test + barycentric weights. Back-faces (CCW) are excluded.
     Note: p contains all pixel positions having shape (H, W, 2)
     """
@@ -209,8 +209,8 @@ def point_in_triangle(a, b, c, p, mode, softness, inside_method="distance_square
             sj.greater_equal(jnp.sign(b2) * b2**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
             sj.greater_equal(jnp.sign(b3) * b3**2, 0.0, mode=mode, softness=softness, epsilon=_EPS),
         ], axis=-1), axis=-1,
-        use_geometric_mean=True)
-    return inside, b1, b2, b3
+        use_geometric_mean=False)
+    return inside, weight_a, weight_b, weight_c
 
 
 # --- Vertex transform & projection ----------------------------------------
@@ -310,11 +310,11 @@ def rasterize_triangle(triangle,
 @partial(jax.jit, static_argnames="mode")
 def render(target, 
            scene_data, 
-           mode="hard", 
+           mode="smooth", 
            softness_depth=1e-4, 
            softness_inside=1e-4,
            background_color=0.0,
-           background_depth_epsilon=-1.0):
+           background_depth_epsilon=_EPS):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -354,12 +354,12 @@ def render(target,
         return (x_max - x) / (x_max - x_min)
 
     normed_depth = normalize(depths)
-    normed_depth = jnp.r_[normed_depth, jnp.full((1, h, w), jnp.min(normed_depth))]
-    depths = jnp.r_[depths, jnp.full((1, h, w), jnp.max(depths))]
-    colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
-    insides = jnp.r_[insides, jnp.ones((1, h, w))]
+    # normed_depth = jnp.r_[normed_depth, jnp.full((1, h, w), jnp.min(normed_depth))]
+    # depths = jnp.r_[depths, jnp.full((1, h, w), jnp.max(depths))]
+    # colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
+    # insides = jnp.r_[insides, jnp.ones((1, h, w))]
     
-    weights = jnp.moveaxis(sj.argmax(normed_depth + softness_depth * jnp.log(insides), 
+    weights = jnp.moveaxis(sj.argmax(normed_depth + jnp.log(insides), 
                                      axis=0, 
                                      mode=mode, 
                                      softness=softness_depth,
