@@ -147,21 +147,21 @@ def point_in_triangle(a, b, c, p, mode, softness, inside_method="area"):
     area_abp = signed_parallelogram_area(a, b, p)
     area_bcp = signed_parallelogram_area(b, c, p)
     area_cap = signed_parallelogram_area(c, a, p)
-    
-    weight_a = jnp.clip(area_bcp, 0.0, 1.0)
-    weight_b = jnp.clip(area_cap, 0.0, 1.0)
-    weight_c = jnp.clip(area_abp, 0.0, 1.0)
+    area_total = area_abp + area_bcp + area_cap
+    weight_a = jnp.clip(area_bcp / area_total, 0.0, 1.0)
+    weight_b = jnp.clip(area_cap / area_total, 0.0, 1.0)
+    weight_c = jnp.clip(area_abp / area_total, 0.0, 1.0)
     weight_total = weight_a + weight_b + weight_c
     weight_a = safe_division(weight_a, weight_total)
     weight_b = safe_division(weight_b, weight_total)
     weight_c = safe_division(weight_c, weight_total)
     
     if inside_method == "distance":
-        dist_sq = signed_squared_dist(a, b, c, 
+        signed_dist_sq = signed_squared_dist(a, b, c, 
                                       weight_a, weight_b, weight_c,
                                       area_abp, area_bcp, area_cap,
                                       p)
-        inside = sj.greater_equal(dist_sq, 0.0, mode=mode, softness=softness, epsilon=_EPS)
+        inside = sj.greater_equal(signed_dist_sq, 0.0, mode=mode, softness=softness, epsilon=_EPS)
     elif inside_method == "area":
         inside = sj.all(jnp.stack([
             sj.greater_equal(area_abp, 0.0, mode=mode, softness=softness, epsilon=_EPS),
@@ -277,10 +277,10 @@ def rasterize_triangle(triangle,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e0, 
-           softness_inside=1e-1,
-           background_color=1.0,
-           background_depth_epsilon=1e-6):
+           softness_depth=5e0, 
+           softness_inside=1e1,
+           background_color=0.0,
+           background_depth_epsilon=-1e4):
     """Composite every model in ``scene_data`` into ``target``.
 
     Per model: project vertices (``process_model``), shade every
@@ -315,20 +315,23 @@ def render(target,
     )
     
     def normalize(x):
-        x_near = jnp.min(x, keepdims=True)
-        x_far = jnp.max(x, keepdims=True)
-        return (x_far - x) / (x_far - x_near)
+        x_min = jnp.min(x, keepdims=True)
+        x_max = jnp.max(x, keepdims=True)
+        return (x_max - x) / (x_max - x_min)
 
-    normed_depth = jnp.r_[normalize(depths), jnp.full((1, h, w), background_depth_epsilon)]
-    insides = jnp.r_[insides, jnp.ones((1, h, w))]
-    weights = jnp.moveaxis(sj.argmax(normed_depth + jnp.log(insides + _EPS), 
+    normed_depth = normalize(depths)
+    #normed_depth = jnp.r_[normalize(depths), jnp.full((1, h, w), background_depth_epsilon)]
+    #depths = jnp.r_[depths, jnp.full((1, h, w), jnp.max(depths))]
+    #colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
+    #insides = jnp.r_[insides, jnp.zeros((1, h, w))]
+    
+    weights = jnp.moveaxis(sj.argmax(normed_depth + softness_depth * jnp.log(insides), 
                                      axis=0, 
                                      mode=mode, 
                                      softness=softness_depth,
                                      standardize=False), -1, 0)   
-    depths = jnp.r_[depths, jnp.zeros((1, h, w))]
+
     win_depth = jnp.sum(weights * depths, axis=0)
-    colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
     return RenderTarget(color_buffer=win_color, depth_buffer=win_depth)
@@ -410,7 +413,7 @@ def main():
     import matplotlib.pyplot as plt
 
     here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "cube.obj"))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere.obj"))
     # Centre cube on the origin so y-rotation spins it in place.
     vertices = vertices - 0.5
 
@@ -423,7 +426,7 @@ def main():
         ),
     )
 
-    vertices2, normals2, tex_coords2 = _load_obj(os.path.join(here, "floor.obj"))
+    #vertices2, normals2, tex_coords2 = _load_obj(os.path.join(here, "cube_fine.obj"))
     
     def make_scene(angle_rad):
         model = Model(

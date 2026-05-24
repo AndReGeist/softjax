@@ -29,13 +29,14 @@ def main():
     a = jnp.array([0.20, 0.25])
     b = jnp.array([0.50, 0.85])
     c = jnp.array([0.80, 0.30])
+    #c = jnp.array([0.55, 0.83])
 
     # Sweep p over a slightly larger square so we can see extrapolation
     # outside the triangle as well.
     x_range = (-0.1, 1.1)
     y_range = (-0.1, 1.1)
     n = 400
-    softness = 0.05
+    softness = 1e-1
 
     out_hard   = sweep(a, b, c, x_range, y_range, n, mode="hard",   softness=softness)
     out_smooth = sweep(a, b, c, x_range, y_range, n, mode="smooth", softness=softness)
