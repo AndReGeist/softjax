@@ -92,7 +92,7 @@ def main():
         R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg)) @ rf._rotation_x(jnp.deg2rad(180))
         position_true = jnp.array([0.6, 0.6, 0.0])  # unknown translation we try to recover
         learning_rate = 1e-2
-        n_steps = 160
+        n_steps = 161
         position_start = jnp.array([-0.6, -0.6, 0.0])
         params = (jnp.diag(jnp.array([1.3, 1.1, 0.9])), position_start)  # Init values
         learning_rate = 1e-1
@@ -159,7 +159,7 @@ def main():
 
     # Iterations at which to snapshot the (hard) render for the progress plot.
     #snapshot_steps = [0, n_steps // 4, 2 * n_steps // 4, 3 * n_steps // 4, n_steps - 1]
-    snapshot_steps = [0, 10, 20, 40, 80, 160]
+    snapshot_steps = [0, 10, 20, 40, 160]
     
     # --- Training loop ----------------------------------------------------
     losses, rot_errors, pos_errors = [], [], []
