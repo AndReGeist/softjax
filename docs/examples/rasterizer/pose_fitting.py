@@ -72,21 +72,33 @@ def y_angle(r):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
 
-    # Optimization at a modest resolution keeps ~400 jitted iterations fast.
-    H, W = 128, 128
-    angle_true_deg = 90  # unknown rotation we try to recover
-    position_true = jnp.array([0.3, 0.2, 0.0])  # unknown translation we try to recover
-    learning_rate = 1e-2
-    n_steps = 400
-    params = (jnp.diag(jnp.array([1.3, 1.1, 0.9])), jnp.zeros(3))  # Init values
+    select_run = "sphere"
 
-    # --- Geometry ---------------------------------------------------------
-    # The sphere's loss landscape descends monotonically from 0 deg to the
-    # target with ~32% relative depth at the default render softness, so no
-    # softness annealing is needed -- plain gradient descent converges. (A
-    # faceted object such as the cube has a depth-ordering loss ridge near
-    # ~15 deg that traps the 0-deg init; a sphere has no such ridge.)
-    sphere_v, sphere_n, sphere_t = rf._load_obj(os.path.join(here, "sphere.obj"))
+    if select_run == "dave":
+        # Optimization at a modest resolution keeps ~400 jitted iterations fast.
+        H, W = 128, 128
+        angle_true_deg = 0  # unknown rotation we try to recover
+        R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg)) @ rf._rotation_x(jnp.deg2rad(180))
+        position_true = jnp.array([0.3, 0.8, 0.0])  # unknown translation we try to recover
+        pos_init = jnp.zeros(3)
+        params = (rf._rotation_y(76.0) @ R_true, pos_init)
+        n_steps = 100
+        learning_rate = 1e-2
+        scale = 1.0
+        # rot_init / params set below relative to R_true (180° about Y from ground truth).
+    elif select_run == "sphere":
+        H, W = 128, 128
+        angle_true_deg = 90  # unknown rotation we try to recover
+        R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg)) @ rf._rotation_x(jnp.deg2rad(180))
+        position_true = jnp.array([0.6, 0.6, 0.0])  # unknown translation we try to recover
+        learning_rate = 1e-2
+        n_steps = 160
+        position_start = jnp.array([-0.6, -0.6, 0.0])
+        params = (jnp.diag(jnp.array([1.3, 1.1, 0.9])), position_start)  # Init values
+        learning_rate = 1e-1
+        scale = 0.7
+        
+    sphere_v, sphere_n, sphere_t = rf._load_obj(os.path.join(here, f"{select_run}.obj"))
 
     camera = rf.Camera(
         fov=jnp.asarray(jnp.pi / 3),
@@ -112,18 +124,18 @@ def main():
             transform=rf.Transform(
                 position=position,
                 rotation=rotation,
-                scale=jnp.asarray(0.5, dtype=jnp.float32),
+                scale=jnp.asarray(scale, dtype=jnp.float32),
             ),
             shader=rf._normal_shader,
         )
         return rf.SceneData(camera=camera, models=[sphere])
 
     def render_color(rotation, position, mode):
-        return rf.render(empty_target(), make_scene(rotation, position),
-                         mode=mode).color_buffer
-
+        out = rf.render(empty_target(), make_scene(rotation, position),
+                         mode=mode)
+        return out.color_buffer
+    
     # --- Target: sphere at an unknown pose, hard rasterization ------------
-    R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg))
     target_image = render_color(R_true, position_true, mode="hard")
 
     # --- Loss: L2 between smooth render and the hard target ---------------
@@ -145,8 +157,13 @@ def main():
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss
 
+    # Iterations at which to snapshot the (hard) render for the progress plot.
+    #snapshot_steps = [0, n_steps // 4, 2 * n_steps // 4, 3 * n_steps // 4, n_steps - 1]
+    snapshot_steps = [0, 10, 20, 40, 80, 160]
+    
     # --- Training loop ----------------------------------------------------
     losses, rot_errors, pos_errors = [], [], []
+    snapshots = []  # (step, hard render) at each snapshot_steps entry
     print(f"Fitting pose: target rotation = {angle_true_deg:.1f} deg about Y, "
           f"target position = {tuple(float(v) for v in position_true)}, "
           f"init = (I, 0), lr = {learning_rate}, steps = {n_steps}")
@@ -159,6 +176,8 @@ def main():
         losses.append(float(loss))
         rot_errors.append(err_deg)
         pos_errors.append(pos_err)
+        if step in snapshot_steps:
+            snapshots.append((step, render_color(svd(M), t, mode="hard")))
         if step % 20 == 0 or step == n_steps - 1:
             print(f"  step {step:4d}   loss {float(loss):.6e}   "
                   f"rot_err {err_deg:7.3f} deg   pos_err {pos_err:.4f}")
@@ -198,7 +217,7 @@ def main():
     ax_loss = fig.add_subplot(gs[1, 0])
     ax_loss.semilogy(losses, color="C0")
     ax_loss.set_xlabel("iteration")
-    ax_loss.set_ylabel("L2 image loss")
+    #ax_loss.set_ylabel("L2 image loss")
     ax_loss.set_title("Euclidean image loss", fontsize=10)
     ax_loss.grid(True, alpha=0.3)
 
@@ -219,6 +238,32 @@ def main():
     out_path = os.path.join(here, "pose_fitting.png")
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
     print(f"Wrote {out_path}")
+
+    # --- Progress plot: loss | target | 4 estimated renders ---------------
+    fig2, axes2 = plt.subplots(1, 7, figsize=(2.4 * 6, 3.0),
+                               constrained_layout=True)
+    #fig2.suptitle("Pose fitting progress")
+
+    axes2[0].semilogy(losses, color="C0")
+    axes2[0].set_xlabel("iteration")
+    axes2[0].set_ylabel("L2 image loss")
+    #axes2[0].set_title("Euclidean image loss", fontsize=9)
+    axes2[0].grid(True, alpha=0.3)
+
+    axes2[1].imshow(jnp.clip(target_image, 0.0, 1.0))
+    axes2[1].set_title("target image", fontsize=9)
+    axes2[1].set_xticks([])
+    axes2[1].set_yticks([])
+
+    for ax, (snap_step, snap_img) in zip(axes2[2:], snapshots):
+        ax.imshow(jnp.clip(snap_img, 0.0, 1.0))
+        ax.set_title(f"estimate - iteration {snap_step}", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    out_path2 = os.path.join(here, "pose_fitting_progress.png")
+    fig2.savefig(out_path2, dpi=300, bbox_inches="tight")
+    print(f"Wrote {out_path2}")
 
 
 if __name__ == "__main__":

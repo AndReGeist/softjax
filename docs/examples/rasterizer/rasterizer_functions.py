@@ -311,7 +311,7 @@ def rasterize_triangle(triangle,
 def render(target, 
            scene_data, 
            mode="smooth", 
-           softness_depth=1e0, 
+           softness_depth=1.0e-1, 
            softness_inside=1.0e-1,
            background_color=0.0,
            background_depth_epsilon=_EPS):
@@ -347,6 +347,7 @@ def render(target,
     colors, depths, insides = jax.tree.map(
         lambda *xs: jnp.concatenate(xs, axis=0), *per_model_buffers,
     )
+    print(depths.shape, insides.shape)
     
     def normalize(x):
         x_min = jnp.min(x, keepdims=True)
@@ -359,12 +360,13 @@ def render(target,
     colors = jnp.r_[colors, jnp.full((1, h, w, 3), background_color)]
     insides = jnp.r_[insides, jnp.ones((1, h, w))]
     
-    weights = jnp.moveaxis(sj.argmax(normed_depth / softness_depth + jnp.log(insides + _EPS), 
+    weights = jnp.moveaxis(sj.argmax((normed_depth/softness_depth + jnp.log(insides + _EPS)), 
                                      axis=0, 
                                      mode=mode, 
                                      softness=1.0,
                                      standardize=False), -1, 0)
-
+    #weights_depth = sj.argmax((normed_depth * insides) / softness_depth, axis=0, mode=mode, softness=softness_depth, standardize=False)
+    #weights = jnp.moveaxis(weights_depth, -1, 0)
     win_depth = jnp.sum(weights * depths, axis=0)
     win_color = jnp.sum(weights[..., None] * colors, axis=0) # (H, W, 3)
 
@@ -465,12 +467,33 @@ def main():
     import os
     import matplotlib.pyplot as plt
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    vertices, normals, tex_coords = _load_obj(os.path.join(here, "sphere2.obj"))
-    # Centre cube on the origin so y-rotation spins it in place.
-    #vertices = vertices - 0.5
+    # SETTINGS
+    MODEL_NAME = "sphere"  # "sphere" or "sphere"
 
-    H, W = 256, 256
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    vertices, normals, tex_coords = _load_obj(os.path.join(here, MODEL_NAME + ".obj"))
+    # Centre cube on the origin so y-rotation spins Fit in place.
+    #vertices = vertices - 0.5
+    
+    if MODEL_NAME == "dave":
+        H, W = 128, 128
+        pos = jnp.array([0.0, 1.1, 0.0])
+        rot = _rotation_x(jnp.deg2rad(180))
+        scale = 1.3
+    elif MODEL_NAME == "sphere":
+        H, W = 128, 128
+        pos = jnp.zeros(3)
+        rot = jnp.eye(3)
+        scale = 1.0
+    elif MODEL_NAME == "cube":
+        H, W = 128, 128
+        pos = jnp.zeros(3)
+        rot = jnp.eye(3)
+        scale = 1.0
+        vertices = vertices - 0.5
+        
+        
     camera = Camera(
         fov=jnp.asarray(jnp.pi / 3),
         transform=Transform(
@@ -487,9 +510,9 @@ def main():
             tex_coords=tex_coords,
             normals=normals,
             transform=Transform(
-                position=jnp.zeros(3),
-                rotation=_rotation_y(angle_rad),
-                scale=jnp.asarray(1.5, dtype=jnp.float32),
+                position=pos,
+                rotation=_rotation_y(angle_rad) @ rot,
+                scale=scale,
             ),
             shader=_normal_shader,
         )
