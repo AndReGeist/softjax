@@ -468,7 +468,7 @@ def main():
     import matplotlib.pyplot as plt
 
     # SETTINGS
-    MODEL_NAME = "sphere"  # "sphere" or "sphere"
+    MODEL_NAME = "dave"  # "sphere" or "sphere"
 
 
     here = os.path.dirname(os.path.abspath(__file__))

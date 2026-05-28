@@ -72,19 +72,20 @@ def y_angle(r):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
 
-    select_run = "sphere"
+    select_run = "dave"
 
     if select_run == "dave":
         # Optimization at a modest resolution keeps ~400 jitted iterations fast.
         H, W = 128, 128
+        scale = 1.3
         angle_true_deg = 0  # unknown rotation we try to recover
-        R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg)) @ rf._rotation_x(jnp.deg2rad(180))
-        position_true = jnp.array([0.3, 0.8, 0.0])  # unknown translation we try to recover
-        pos_init = jnp.zeros(3)
-        params = (rf._rotation_y(76.0) @ R_true, pos_init)
-        n_steps = 100
-        learning_rate = 1e-2
-        scale = 1.0
+        R_true = rf._rotation_x(jnp.deg2rad(150))
+        position_true = jnp.array([0.0, 1.1, 0.0])  # unknown translation we try to recover
+        position_start = jnp.array([0.0, 0.8, 0.3])
+        params = (jnp.diag(jnp.array([0.0, -0.4, 0.9])), position_start)  # Init values
+        n_steps = 601
+        learning_rate = 1e-1
+        scale = 1.1
         # rot_init / params set below relative to R_true (180° about Y from ground truth).
     elif select_run == "sphere":
         H, W = 128, 128
@@ -159,7 +160,7 @@ def main():
 
     # Iterations at which to snapshot the (hard) render for the progress plot.
     #snapshot_steps = [0, n_steps // 4, 2 * n_steps // 4, 3 * n_steps // 4, n_steps - 1]
-    snapshot_steps = [0, 10, 20, 40, 160]
+    snapshot_steps = [0, 10, 200, 400, 600]
     
     # --- Training loop ----------------------------------------------------
     losses, rot_errors, pos_errors = [], [], []
