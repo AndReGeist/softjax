@@ -215,7 +215,7 @@ def main():
     parser.add_argument(
         "--softness", type=float, default=0.1, help="Softness (inverse of diffsort steepness)"
     )
-    parser.add_argument("--mode", type=str, default="smooth", choices=["smooth", "c0", "c1", "c2"])
+    parser.add_argument("--mode", type=str, default="smooth", choices=["hard", "smooth", "c0", "c1", "c2"])
     parser.add_argument(
         "--method",
         type=str,
