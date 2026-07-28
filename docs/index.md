@@ -15,6 +15,7 @@ SoftJAX provides soft differentiable drop-in replacements for traditionally non-
 
 - elementwise operators: `abs`, `relu`, `clip`, `sign`, `round` and `heaviside`;
 - array-valued operators: `(arg)max`, `(arg)min`, `(arg)quantile`, `(arg)median`, `(arg)sort`, `(arg)top_k` and `rank`;
+- random sampling operators under `softjax.random`, including categorical, Bernoulli, choice, permutation, Rademacher, binomial, and multinomial samplers plus straight-through variants;
 - comparison operators such as: `greater`, `equal` or `isclose`;
 - logical operators such as: `logical_and`, `all` or `any`;
 - selection operators such as: `where`, `take_along_axis`, `dynamic_index_in_dim` or `choose`.
@@ -23,7 +24,9 @@ All operators offer multiple modes and adjustable strength of softening, allowin
 
 Moreover, we tightly integrate functionality for deploying functions using [straight-through-estimation](https://docs.jax.dev/en/latest/advanced-autodiff.html#straight-through-estimator-using-stop-gradient), where we use non-differentiable functions in the forward pass and their differentiable replacements in the backward pass.
 
-*Note, while SoftJAX is designed to provide direct drop-in replacements for JAX's operators, soft axis-wise operators return probability distributions over indices (instead of an index), effectively changing the shape of the function's output.*
+*Note, while SoftJAX is designed to provide direct drop-in replacements for JAX's operators, soft axis-wise operators return probability distributions over indices (instead of an index), effectively changing the shape of the function's output. Index-returning functions can also return log probabilities with `return_log_probs=True`.*
+
+When differentiating through exact log probabilities, prefer `mode="smooth"`. Sparse modes (`"c0"`, `"c1"`, `"c2"`) can produce exact zero probabilities, whose exact log is `-inf`; replacing `-inf` after the log, e.g. with `jnp.nan_to_num`, does not generally make gradients finite. If you want bounded log values for a sparse mode, use `return_log_probs=True, log_prob_eps=eps`. This floors probabilities before taking `log` and renormalizes along the soft-index axis, so exponentiating the returned logs still sums to 1 up to floating-point error.
 
 
 ## Installation
