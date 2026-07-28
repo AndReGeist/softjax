@@ -125,6 +125,7 @@ nav:
         - Function overview: 'examples/long_example.ipynb'
         - 'plots.ipynb'
         - 'examples/manifold_points.ipynb'
+        - Rendering: 'examples/rasterizer/differentiable_rasterizer.ipynb'
     - API:
         - 'api/softjax_operators.md'
         - 'api/random.md'

@@ -10,7 +10,7 @@ import os
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 
-import rasterizer_functions as rf
+import rasterizer as rf
 
 
 def sweep(a, b, c, x_range, y_range, n, mode, softness):
@@ -58,36 +58,34 @@ def main():
 
     for row_idx, (mode_label, fields) in enumerate(rows):
         for col_idx, (name, field) in enumerate(zip(field_names, fields)):
-            if col_idx == 0:
-                ax = axes[row_idx, col_idx]
-                arr = jnp.asarray(field)
-                vmin, vmax = float(jnp.min(arr)), float(jnp.max(arr))
-                im = ax.imshow(
-                    arr,
-                    extent=(x_range[0], x_range[1], y_range[0], y_range[1]),
-                    origin="lower",
-                    cmap="viridis",
-                    vmin=vmin, vmax=vmax,
-                )
-                # Triangle outline.
-                xs = [float(a[0]), float(b[0]), float(c[0]), float(a[0])]
-                ys = [float(a[1]), float(b[1]), float(c[1]), float(a[1])]
-                ax.plot(xs, ys, color="white", linewidth=1.2)
-                ax.scatter([float(a[0])], [float(a[1])], color="white", s=18)
-                ax.scatter([float(b[0])], [float(b[1])], color="white", s=18)
-                ax.scatter([float(c[0])], [float(c[1])], color="white", s=18)
-                ax.annotate("a", (float(a[0]), float(a[1])), color="white",
-                            xytext=(4, 4), textcoords="offset points")
-                ax.annotate("b", (float(b[0]), float(b[1])), color="white",
-                            xytext=(4, 4), textcoords="offset points")
-                ax.annotate("c", (float(c[0]), float(c[1])), color="white",
-                            xytext=(4, 4), textcoords="offset points")
+            ax = axes[row_idx, col_idx]
+            arr = jnp.asarray(field)
+            vmin, vmax = float(jnp.min(arr)), float(jnp.max(arr))
+            im = ax.imshow(
+                arr,
+                extent=(x_range[0], x_range[1], y_range[0], y_range[1]),
+                origin="lower",
+                cmap="viridis",
+                vmin=vmin, vmax=vmax,
+            )
+            # Triangle outline.
+            xs = [float(a[0]), float(b[0]), float(c[0]), float(a[0])]
+            ys = [float(a[1]), float(b[1]), float(c[1]), float(a[1])]
+            ax.plot(xs, ys, color="white", linewidth=1.2)
+            ax.scatter([float(a[0])], [float(a[1])], color="white", s=18)
+            ax.scatter([float(b[0])], [float(b[1])], color="white", s=18)
+            ax.scatter([float(c[0])], [float(c[1])], color="white", s=18)
+            ax.annotate("a", (float(a[0]), float(a[1])), color="white",
+                        xytext=(4, 4), textcoords="offset points")
+            ax.annotate("b", (float(b[0]), float(b[1])), color="white",
+                        xytext=(4, 4), textcoords="offset points")
+            ax.annotate("c", (float(c[0]), float(c[1])), color="white",
+                        xytext=(4, 4), textcoords="offset points")
 
-                ax.set_title(f"{mode_label}",
-                            fontsize=10)
-                ax.set_xticks([])
-                ax.set_yticks([])
-                fig.colorbar(im, ax=ax, shrink=0.7)
+            ax.set_title(f"{mode_label}: {name}", fontsize=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(im, ax=ax, shrink=0.7)
 
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "point_in_triangle_viz.png")

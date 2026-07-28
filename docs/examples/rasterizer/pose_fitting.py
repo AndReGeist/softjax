@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-import rasterizer_functions as rf
+import rasterizer as rf
 
 
 # --- Rotation parameterization -------------------------------------------
@@ -62,7 +62,7 @@ def geodesic_angle(r_a, r_b):
 def y_angle(r):
     """Y-rotation angle (radians) of a rotation matrix.
 
-    Exact for ``rf._rotation_y`` outputs; an approximation otherwise.
+    Exact for ``rf.rotation_y`` outputs; an approximation otherwise.
     """
     return jnp.arctan2(r[0, 2], r[0, 0])
 
@@ -79,7 +79,7 @@ def main():
         H, W = 128, 128
         scale = 1.3
         angle_true_deg = 0  # unknown rotation we try to recover
-        R_true = rf._rotation_x(jnp.deg2rad(150))
+        R_true = rf.rotation_x(jnp.deg2rad(150))
         position_true = jnp.array([0.0, 1.1, 0.0])  # unknown translation we try to recover
         position_start = jnp.array([0.0, 0.8, 0.3])
         params = (jnp.diag(jnp.array([0.0, -0.4, 0.9])), position_start)  # Init values
@@ -90,7 +90,7 @@ def main():
     elif select_run == "sphere":
         H, W = 128, 128
         angle_true_deg = 90  # unknown rotation we try to recover
-        R_true = rf._rotation_y(jnp.deg2rad(angle_true_deg)) @ rf._rotation_x(jnp.deg2rad(180))
+        R_true = rf.rotation_y(jnp.deg2rad(angle_true_deg)) @ rf.rotation_x(jnp.deg2rad(180))
         position_true = jnp.array([0.6, 0.6, 0.0])  # unknown translation we try to recover
         learning_rate = 1e-2
         n_steps = 161
@@ -99,7 +99,7 @@ def main():
         learning_rate = 1e-1
         scale = 0.7
         
-    sphere_v, sphere_n, sphere_t = rf._load_obj(os.path.join(here, f"{select_run}.obj"))
+    sphere_v, sphere_n, sphere_t = rf.load_obj(os.path.join(here, "meshes", f"{select_run}.obj"))
 
     camera = rf.Camera(
         fov=jnp.asarray(jnp.pi / 3),
@@ -127,7 +127,7 @@ def main():
                 rotation=rotation,
                 scale=jnp.asarray(scale, dtype=jnp.float32),
             ),
-            shader=rf._normal_shader,
+            shader=rf.normal_shader,
         )
         return rf.SceneData(camera=camera, models=[sphere])
 

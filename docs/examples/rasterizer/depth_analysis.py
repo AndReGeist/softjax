@@ -3,19 +3,21 @@
 Builds a single-triangle `RasterizedModel` with hand-chosen screen
 positions and vertex depths, runs `rasterize_triangle` over an H x W
 pixel grid in both `hard` and `smooth` modes, and plots the resulting
-`depth` field (and `inside` for context). The expected ground-truth
-linear-barycentric depth is plotted alongside so the centroid-collapse
-behaviour of the current clipped-area weights is easy to spot — over
-the interior of the triangle the rendered depth is constant (the
-centroid of the three vertex depths) instead of the linear ramp shown
-in the ground-truth column.
+`depth` field (and `inside` for context). The analytic linear-barycentric
+depth is plotted alongside as a reference: the rendered depth reproduces
+it over the triangle interior, so the `|rendered - gt|` panel is near
+zero inside the silhouette.
+
+Note that `mode` only relaxes the *coverage* test (`inside`); the
+barycentric weights driving the interpolation are the same either way,
+so the `hard` and `smooth` depth panels are identical.
 """
 
 import os
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 
-import rasterizer_functions as rf
+import rasterizer as rf
 
 
 def make_single_triangle(screen_pos, vertex_depths):
@@ -30,7 +32,7 @@ def make_single_triangle(screen_pos, vertex_depths):
 
 def ground_truth_depth(a, b, c, depths, h, w):
     """Linear barycentric depth over the full grid (signed weights, no clip)."""
-    p = rf._pixel_grid(h, w)                            # (H, W, 2)
+    p = rf.pixel_grid(h, w)                            # (H, W, 2)
     area_abp = rf.signed_parallelogram_area(a, b, p)
     area_bcp = rf.signed_parallelogram_area(b, c, p)
     area_cap = rf.signed_parallelogram_area(c, a, p)
